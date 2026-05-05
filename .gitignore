@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.vite/
+coverage/
+*.log
+client/dist/
+server/dist/

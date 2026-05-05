@@ -1,0 +1,1122 @@
+import * as Phaser from "phaser";
+import {
+  ARENA_HEIGHT,
+  ARENA_WIDTH,
+  FFA_CORNER_BASE_ZONE_RADIUS,
+  FFA_OCTAGON_CENTER_X,
+  FFA_OCTAGON_CENTER_Y,
+  FFA_OCTAGON_RADIUS,
+  INPUT_SEND_RATE_MS,
+  PICKUP_RADIUS,
+  PLAYER_RADIUS,
+  PROJECTILE_EXPLOSION_RADIUS,
+  PROJECTILE_RADIUS,
+  SAFE_ZONE_SIZE,
+  ffaBaseCenters,
+  octagonVertices,
+  type ArenaState,
+  type FlagState,
+  type InputState,
+  type JoinOptions,
+  type PickupState,
+  type PlayerState,
+  type ProjectileState,
+  type SpikeState,
+} from "@shared";
+import { getObjectiveWorldTarget, isInEnemySafeZone, objectiveScreenMarker } from "./matchHudHelpers";
+import type { SfxController } from "../audio/SfxController";
+import type { NetClient } from "../network/NetClient";
+import type { CrazyGamesService } from "../sdk/CrazyGamesService";
+
+const PICKUP_COLORS: Record<string, number> = {
+  speed: 0xffdf63,
+  ammo: 0xff67df,
+  shield: 0x5cf0ff,
+  magnet: 0xff9c5c,
+  repel: 0xc07dff,
+};
+const PICKUP_LABELS: Record<string, string> = { speed: "S", ammo: "A", shield: "H", magnet: "M", repel: "R" };
+const MAP_THEMES: Array<{ bg1: number; bg2: number; bg3: number; bg4: number; grid: number; ring: number; ringLine: number }> = [
+  { bg1: 0x152238, bg2: 0x152238, bg3: 0x0c1830, bg4: 0x0c1830, grid: 0x2a4a72, ring: 0x2e4580, ringLine: 0xa3b2ff },
+  { bg1: 0x1a1530, bg2: 0x1a1530, bg3: 0x100828, bg4: 0x100828, grid: 0x4a3a78, ring: 0x4a3a8a, ringLine: 0xd4b8ff },
+  { bg1: 0x102a28, bg2: 0x102a28, bg3: 0x081f20, bg4: 0x081f20, grid: 0x2d6a62, ring: 0x2d7a70, ringLine: 0x8cffea },
+];
+const TEAM_COLORS: Record<string, number> = {
+  red: 0xff6a76,
+  blue: 0x66a6ff,
+  green: 0x79ff6d,
+  yellow: 0xffd84f,
+  ffa0: 0xff6a76,
+  ffa1: 0x66a6ff,
+  ffa2: 0x79ff6d,
+  ffa3: 0xffd84f,
+  ffa4: 0xc07dff,
+  ffa5: 0xff9c5c,
+  ffa6: 0x5cf0ff,
+  ffa7: 0xb8ff8a,
+};
+/** Same four teams / vertex pairing as server octagon FFA (sandbox rules). */
+const OCTAGON_SANDBOX_BASE_SLOTS: readonly { team: string; vertexIndex: number }[] = [
+  { team: "red", vertexIndex: 0 },
+  { team: "blue", vertexIndex: 2 },
+  { team: "green", vertexIndex: 4 },
+  { team: "yellow", vertexIndex: 6 },
+];
+const CAMERA_VIEW_WIDTH_WORLD = 1850;
+const PLAYER_BODY_RADIUS_PX = 32;
+const PLAYER_SIZE_MULTIPLIER = 2.5;
+const LOCAL_PLAYER_SCALE_MULTIPLIER = 1.24;
+const PROJECTILE_SIZE_MULTIPLIER = 0.5;
+const VIEWPORT_BORDER_COLOR = 0xff0000;
+const VIEWPORT_BORDER_ALPHA = 1;
+const VIEWPORT_BORDER_WIDTH = 16;
+const PROGRESSION_MILESTONES = [40, 90, 150];
+type CameraViewWorld = { left: number; top: number; width: number; height: number; scale: number };
+
+export class GameScene extends Phaser.Scene {
+  private readonly playerVisuals = new Map<string, Phaser.GameObjects.Container>();
+  private readonly pickupVisuals = new Map<string, Phaser.GameObjects.Container>();
+  private readonly projectileVisuals = new Map<string, Phaser.GameObjects.Arc>();
+  private readonly spikeVisuals = new Map<string, Phaser.GameObjects.Polygon>();
+  private keys!: Record<string, Phaser.Input.Keyboard.Key>;
+  private pointerFire = false;
+  private lastInputSentAt = 0;
+  /** Full-screen gradient; only redrawn when theme, mode, or viewport size changes. */
+  private arenaBackdropGraphics!: Phaser.GameObjects.Graphics;
+  private lastArenaBackdropKey = "";
+  private arenaGraphics!: Phaser.GameObjects.Graphics;
+  private minimapGraphics!: Phaser.GameObjects.Graphics;
+  private dangerOverlay!: Phaser.GameObjects.Graphics;
+  private objectiveScreenGraphics!: Phaser.GameObjects.Graphics;
+  private leaderboardPanel!: Phaser.GameObjects.Graphics;
+  private objectiveFlagLabel!: Phaser.GameObjects.Text;
+  private statusText!: Phaser.GameObjects.Text;
+  private positionText!: Phaser.GameObjects.Text;
+  private timerText!: Phaser.GameObjects.Text;
+  private controlsText!: Phaser.GameObjects.Text;
+  private objectiveText!: Phaser.GameObjects.Text;
+  private leaderboardText!: Phaser.GameObjects.Text;
+  private countdownText!: Phaser.GameObjects.Text;
+  private restartButton!: Phaser.GameObjects.Text;
+  private restarting = false;
+  private cameraFocusX = ARENA_WIDTH * 0.5;
+  private cameraFocusY = ARENA_HEIGHT * 0.5;
+  private cameraViewWorld: CameraViewWorld = { left: 0, top: 0, width: CAMERA_VIEW_WIDTH_WORLD, height: CAMERA_VIEW_WIDTH_WORLD, scale: 1 };
+  private flagCarrierId = "";
+  private lastTrailAtMs = new Map<string, number>();
+  private readonly projectileSnapshot = new Map<string, { x: number; y: number; ownerId: string; radius: number }>();
+  private prevFlagCarrierId = "";
+  private prevPointerFire = false;
+  /**
+   * `main.ts` assigns this right before `new Phaser.Game()` so the first join runs only after this scene’s
+   * `create()` has built HUD/graphics. Do not use `scene.events.once(CREATE, …)` for that: the scene is not
+   * wired into Phaser until boot, so those listeners are unreliable.
+   */
+  pendingJoin: JoinOptions | null = null;
+
+  constructor(private readonly netClient: NetClient, private readonly sdk: CrazyGamesService, private readonly sfx: SfxController) {
+    super("game");
+  }
+
+  create(): void {
+    this.drawStage();
+    this.input.mouse?.disableContextMenu();
+    this.keys = this.input.keyboard!.addKeys("W,A,S,D,LEFT,RIGHT,UP,DOWN,SPACE") as Record<string, Phaser.Input.Keyboard.Key>;
+    this.input.on("pointerdown", () => this.sfx.resume());
+    this.input.on("pointerdown", (pointer: Phaser.Input.Pointer) => { if (pointer.leftButtonDown()) this.pointerFire = true; });
+    this.input.on("pointerup", () => { this.pointerFire = false; });
+    this.scale.on("resize", () => this.applyResponsiveCamera());
+    this.applyResponsiveCamera();
+    this.sdk.loadingStop();
+    const firstJoin = this.pendingJoin;
+    this.pendingJoin = null;
+    if (firstJoin) {
+      void this.startMatch(firstJoin);
+    }
+  }
+
+  async startMatch(options: JoinOptions): Promise<void> {
+    this.restarting = false;
+    this.hideRestartButton();
+    try {
+      const room = await this.netClient.join(options, this.sdk.getInviteRoomId());
+      this.statusText.setText("Joining…");
+      this.sdk.gameplayStart();
+    } catch (error) {
+      console.error("Failed to join tunnel race", error);
+      this.netClient.leave();
+      this.statusText.setText("Reconnecting...");
+      this.time.delayedCall(900, () => {
+        void this.startMatch(options);
+      });
+    }
+  }
+
+  override update(time: number, delta: number): void {
+    const room = this.netClient.room;
+    const state = room?.state;
+    if (!state?.players) {
+      return;
+    }
+
+    const input = this.captureInput();
+    if (input.fire && !this.prevPointerFire) {
+      this.sfx.fire();
+    }
+    this.prevPointerFire = input.fire;
+    if (time - this.lastInputSentAt >= INPUT_SEND_RATE_MS) {
+      this.netClient.sendInput(input);
+      this.lastInputSentAt = time;
+    }
+
+    this.syncWorld(state, delta);
+    this.drawScreenObjectiveOverlay(state);
+    this.updateHud(state);
+  }
+
+  private syncWorld(state: ArenaState, delta: number): void {
+    this.checkLocalProjectileBlasts(state);
+    this.updateCameraViewWorld(delta);
+    this.flagCarrierId = this.getNeutralFlag(state)?.carrierId ?? "";
+    this.drawArena(state);
+    const seenPlayers = new Set<string>();
+    const seenPickups = new Set<string>();
+    const seenProjectiles = new Set<string>();
+    const seenSpikes = new Set<string>();
+    for (const [id, player] of state.players.entries()) {
+      if (!player) continue;
+      seenPlayers.add(id);
+      this.syncPlayerVisual(id, player, delta);
+    }
+    if (state.pickups) {
+      for (const [id, pickup] of state.pickups.entries()) {
+        if (!pickup) continue;
+        seenPickups.add(id);
+        this.syncPickupVisual(id, pickup);
+      }
+    }
+    if (state.projectiles) {
+      for (const [id, projectile] of state.projectiles.entries()) {
+        if (!projectile) continue;
+        seenProjectiles.add(id);
+        this.syncProjectileVisual(id, projectile);
+      }
+    }
+    if (state.spikes) {
+      for (const [id, spike] of state.spikes.entries()) {
+        if (!spike) continue;
+        seenSpikes.add(id);
+        this.syncSpikeVisual(id, spike);
+      }
+    }
+    this.pruneMap(this.playerVisuals, seenPlayers, (v) => v.destroy(true));
+    this.pruneMap(this.pickupVisuals, seenPickups, (v) => v.destroy(true));
+    this.pruneMap(this.projectileVisuals, seenProjectiles, (v) => v.destroy());
+    this.pruneMap(this.spikeVisuals, seenSpikes, (v) => v.destroy());
+    this.drawMinimap(state);
+    this.refreshProjectileSnapshot(state);
+  }
+
+  private syncPlayerVisual(id: string, player: PlayerState, delta: number): void {
+    const visual = this.playerVisuals.get(id) ?? this.createPlayerVisual(player.color);
+    const isLocalPlayer = id === this.netClient.room?.sessionId;
+    const basePlayerScale = (this.toScreenRadius(PLAYER_RADIUS) / PLAYER_BODY_RADIUS_PX) * PLAYER_SIZE_MULTIPLIER;
+    if (isLocalPlayer) {
+      visual.x = this.toScreenX(player.x);
+      visual.y = this.toScreenY(player.y);
+    } else {
+      const followAlpha = Math.min(0.35, delta / 33);
+      visual.x = Phaser.Math.Linear(visual.x, this.toScreenX(player.x), followAlpha);
+      visual.y = Phaser.Math.Linear(visual.y, this.toScreenY(player.y), followAlpha);
+    }
+    visual.rotation = player.rotation;
+    const body = visual.getAt(0) as Phaser.GameObjects.Arc;
+    const nose = visual.getAt(1) as Phaser.GameObjects.Triangle;
+    const carrierRing = visual.getAt(2) as Phaser.GameObjects.Arc;
+    body.fillColor = TEAM_COLORS[player.team] ?? 0xffffff;
+    if (isLocalPlayer) {
+      const cosmeticTier = this.getCosmeticTier(player.score);
+      const accent = cosmeticTier >= 3 ? 0xff79ec : cosmeticTier >= 2 ? 0x71ffed : cosmeticTier >= 1 ? 0xfff46b : 0xffd46b;
+      const strokeColor = player.shieldHits > 0 ? 0x5cf0ff : accent;
+      const strokeW = player.shieldHits > 0 ? 6 : 5;
+      body.setStrokeStyle(strokeW, strokeColor, 1);
+      nose.setFillStyle(accent, 1);
+      visual.setScale(basePlayerScale * LOCAL_PLAYER_SCALE_MULTIPLIER);
+    } else {
+      body.setStrokeStyle(player.shieldHits > 0 ? 4 : 3, player.shieldHits > 0 ? 0x5cf0ff : 0xffffff, 0.95);
+      nose.setFillStyle(0xffffff, 0.95);
+      visual.setScale(basePlayerScale);
+    }
+    const isFlagCarrier = id === this.flagCarrierId;
+    carrierRing.setVisible(
+      isFlagCarrier || player.bulletCharges > 1 || player.speedBoostMs > 0 || player.magnetMs > 0 || player.repelMs > 0,
+    );
+    if (isFlagCarrier) {
+      carrierRing.setStrokeStyle(5, 0xfff46b, 1);
+      carrierRing.setFillStyle(0xfff46b, 0.12);
+      this.emitFlagTrail(player, TEAM_COLORS[player.team] ?? 0xfff46b);
+    } else {
+      carrierRing.setStrokeStyle(3, 0xfff46b, 0.95);
+      carrierRing.setFillStyle(0xfff46b, 0.16);
+    }
+    visual.alpha = player.alive ? 1 : 0.32;
+    visual.setDepth(isLocalPlayer ? 45 : 40);
+    this.playerVisuals.set(id, visual);
+  }
+
+  private syncPickupVisual(id: string, pickup: PickupState): void {
+    const visual = this.pickupVisuals.get(id) ?? this.createPickupVisual(pickup.kind);
+    const outerGlow = visual.getAt(0) as Phaser.GameObjects.Arc;
+    const core = visual.getAt(1) as Phaser.GameObjects.Arc;
+    const icon = visual.getAt(2) as Phaser.GameObjects.Text;
+    const color = PICKUP_COLORS[pickup.kind] ?? 0xffffff;
+    visual.x = this.toScreenX(pickup.x);
+    visual.y = this.toScreenY(pickup.y);
+    visual.setDepth(30);
+    outerGlow.fillColor = color;
+    core.fillColor = color;
+    icon.setText(PICKUP_LABELS[pickup.kind] ?? "?");
+    visual.alpha = pickup.active ? 0.98 : 0.2;
+    const pickupScale = this.toScreenRadius(PICKUP_RADIUS) / 18;
+    visual.setScale(pickup.active ? pickupScale : pickupScale * 0.85);
+    visual.angle = (this.time.now * 0.08 + pickup.x * 0.04) % 360;
+    this.pickupVisuals.set(id, visual);
+  }
+
+  private syncProjectileVisual(id: string, projectile: ProjectileState): void {
+    const color = TEAM_COLORS[projectile.team] ?? 0x9fd7ff;
+    const visual =
+      this.projectileVisuals.get(id) ??
+      this.add.circle(0, 0, this.toScreenRadius(PROJECTILE_RADIUS) * PROJECTILE_SIZE_MULTIPLIER, color, 0.98).setDepth(36);
+    visual.x = this.toScreenX(projectile.x);
+    visual.y = this.toScreenY(projectile.y);
+    visual.fillColor = color;
+    visual.setRadius(this.toScreenRadius(projectile.radius) * PROJECTILE_SIZE_MULTIPLIER);
+    visual.setStrokeStyle(2, 0xffffff, 0.72);
+    this.projectileVisuals.set(id, visual);
+  }
+
+  private syncSpikeVisual(id: string, spike: SpikeState): void {
+    const size = this.toScreenRadius(spike.radius);
+    const points = [0, -1, 1, 0, 0, 1, -1, 0];
+    const pulse = 0.55 + 0.45 * Math.sin(this.time.now * 0.004 + id.length * 0.31);
+    const isPull = spike.spikeKind === "pull";
+    const fill = isPull ? 0xa855f7 : 0xf55c5c;
+    const stroke = isPull ? 0xe9d5ff : 0xfff1b8;
+    const visual =
+      this.spikeVisuals.get(id) ??
+      this.add.polygon(this.toScreenX(spike.x), this.toScreenY(spike.y), points, fill, 0.95).setStrokeStyle(2, stroke, 0.9).setDepth(28);
+    visual.x = this.toScreenX(spike.x);
+    visual.y = this.toScreenY(spike.y);
+    visual.setScale(size);
+    visual.setFillStyle(fill, 0.95);
+    visual.setStrokeStyle(2 + pulse * 1.5, stroke, 0.55 + 0.4 * pulse);
+    if (Math.hypot(spike.vx, spike.vy) > 0.1) visual.angle = Phaser.Math.RadToDeg(Math.atan2(spike.vy, spike.vx)) + 45;
+    this.spikeVisuals.set(id, visual);
+  }
+
+  private drawStage(): void {
+    this.arenaBackdropGraphics = this.add.graphics().setDepth(-1);
+    this.arenaGraphics = this.add.graphics().setDepth(0);
+    this.minimapGraphics = this.add.graphics().setDepth(120);
+    this.dangerOverlay = this.add.graphics().setScrollFactor(0).setDepth(118);
+    this.objectiveScreenGraphics = this.add.graphics().setScrollFactor(0).setDepth(119);
+    this.leaderboardPanel = this.add.graphics().setScrollFactor(0).setDepth(81);
+    this.objectiveFlagLabel = this.add
+      .text(0, 0, "FLAG", this.textStyle(24, "#ffee66"))
+      .setOrigin(0.5)
+      .setScrollFactor(0)
+      .setDepth(121)
+      .setStroke("#1a0f28", 7)
+      .setVisible(false);
+    this.timerText = this.add.text(24, 18, "TIME 0", this.textStyle(22, "#ffe95c"));
+    this.controlsText = this.add.text(24, 48, "WASD move | Left click blast | SPACE boost", this.textStyle(16, "#9fd7ff"));
+    this.statusText = this.add.text(24, 100, "", this.textStyle(15, "#b8c4d8"));
+    this.positionText = this.add.text(-2000, -2000, "", this.textStyle(1, "#000000")).setVisible(false);
+    this.objectiveText = this.add.text(-2000, -2000, "", this.textStyle(1, "#000000")).setVisible(false);
+    this.leaderboardText = this.add
+      .text(0, 22, "", {
+        color: "#f2f7ff",
+        fontFamily: "Consolas, ui-monospace, monospace",
+        fontSize: "13px",
+        fontStyle: "700",
+        align: "right",
+      })
+      .setOrigin(1, 0)
+      .setShadow(0, 2, "#000000", 6, true, true);
+    this.countdownText = this.add
+      .text(this.scale.width * 0.5, this.scale.height * 0.42, "", this.textStyle(92, "#ffffff"))
+      .setOrigin(0.5)
+      .setStroke("#142047", 8)
+      .setDepth(130);
+    this.restartButton = this.add
+      .text(this.scale.width * 0.5, this.scale.height * 0.62, "RESTART", this.textStyle(34, "#ffffff"))
+      .setOrigin(0.5)
+      .setPadding(22, 10, 22, 10)
+      .setBackgroundColor("#b01f3b")
+      .setStroke("#ffffff", 3)
+      .setInteractive({ useHandCursor: true })
+      .setVisible(false)
+      .setAlpha(0)
+      .setDepth(100);
+    this.restartButton.on("pointerdown", () => {
+      void this.restartSession();
+    });
+
+    for (const text of [
+      this.statusText,
+      this.positionText,
+      this.timerText,
+      this.controlsText,
+      this.objectiveText,
+      this.leaderboardText,
+      this.countdownText,
+      this.restartButton,
+    ]) {
+      text.setScrollFactor(0).setDepth(80);
+    }
+    this.countdownText.setDepth(130);
+    this.leaderboardText.setDepth(83);
+  }
+
+  private drawArena(state: ArenaState): void {
+    const graphics = this.arenaGraphics;
+    const width = this.scale.width;
+    const height = this.scale.height;
+    const theme = MAP_THEMES[Math.min(MAP_THEMES.length - 1, Math.max(0, Math.floor(state.mapTheme)))];
+    const backdropKey = `${state.mapTheme}|${state.gameMode}|${Math.round(width)}x${Math.round(height)}`;
+    if (backdropKey !== this.lastArenaBackdropKey) {
+      this.lastArenaBackdropKey = backdropKey;
+      const bg = this.arenaBackdropGraphics;
+      bg.clear();
+      bg.fillGradientStyle(theme.bg1, theme.bg2, theme.bg3, theme.bg4, 1);
+      bg.fillRect(0, 0, width, height);
+    }
+    graphics.clear();
+    const baseMinX = PLAYER_RADIUS;
+    const baseMinY = PLAYER_RADIUS;
+    const baseMaxX = ARENA_WIDTH - PLAYER_RADIUS;
+    const baseMaxY = ARENA_HEIGHT - PLAYER_RADIUS;
+    const pulseT = this.time.now;
+    if (state.gameMode === "ffa") {
+      const insetBases = ffaBaseCenters(FFA_OCTAGON_CENTER_X, FFA_OCTAGON_CENTER_Y, FFA_OCTAGON_RADIUS, 0.11);
+      OCTAGON_SANDBOX_BASE_SLOTS.forEach(({ team, vertexIndex }, i) => {
+        const c = insetBases[vertexIndex];
+        if (!c) return;
+        const sx = this.toScreenX(c.x);
+        const sy = this.toScreenY(c.y);
+        const sr = this.toScreenRadius(FFA_CORNER_BASE_ZONE_RADIUS);
+        const col = TEAM_COLORS[team] ?? 0xffffff;
+        graphics.fillStyle(col, 0.14);
+        graphics.fillCircle(sx, sy, sr);
+        graphics.lineStyle(3, col, 0.55 + 0.25 * Math.sin(pulseT * 0.0025 + i));
+        graphics.strokeCircle(sx, sy, sr);
+      });
+      const playR = FFA_OCTAGON_RADIUS - PLAYER_RADIUS;
+      const ov = octagonVertices(FFA_OCTAGON_CENTER_X, FFA_OCTAGON_CENTER_Y, playR);
+      graphics.lineStyle(5, theme.ringLine, 0.85);
+      const ox0 = this.toScreenX(ov[0]!.x);
+      const oy0 = this.toScreenY(ov[0]!.y);
+      graphics.beginPath();
+      graphics.moveTo(ox0, oy0);
+      for (let i = 1; i < ov.length; i += 1) {
+        const p = ov[i]!;
+        graphics.lineTo(this.toScreenX(p.x), this.toScreenY(p.y));
+      }
+      graphics.closePath();
+      graphics.strokePath();
+    } else {
+      this.drawSafeZoneRect(graphics, baseMinX, baseMinY, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, "red", pulseT);
+      this.drawSafeZoneRect(graphics, baseMaxX - SAFE_ZONE_SIZE, baseMinY, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, "blue", pulseT);
+      this.drawSafeZoneRect(graphics, baseMinX, baseMaxY - SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, "green", pulseT);
+      this.drawSafeZoneRect(graphics, baseMaxX - SAFE_ZONE_SIZE, baseMaxY - SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, "yellow", pulseT);
+    }
+    const centerX = this.toScreenX(state.captureX);
+    const centerY = this.toScreenY(state.captureY);
+    graphics.fillStyle(theme.ring, 1);
+    graphics.fillCircle(centerX, centerY, this.toScreenRadius(state.captureRadius));
+    graphics.lineStyle(4, theme.ringLine, 1);
+    graphics.strokeCircle(centerX, centerY, this.toScreenRadius(state.captureRadius));
+    if (state.captureProgress > 0) {
+      graphics.lineStyle(9, TEAM_COLORS[state.captureTeam] ?? 0xffffff, 0.9);
+      graphics.beginPath();
+      graphics.arc(
+        centerX,
+        centerY,
+        this.toScreenRadius(state.captureRadius) + 11,
+        -Math.PI / 2,
+        -Math.PI / 2 + Math.PI * 2 * state.captureProgress,
+      );
+      graphics.strokePath();
+    }
+    const neutralFlag = this.getNeutralFlag(state);
+    if (neutralFlag && !neutralFlag.carrierId) {
+      const flagX = this.toScreenX(neutralFlag.x);
+      const flagY = this.toScreenY(neutralFlag.y);
+      graphics.fillStyle(0xfff46b, 0.95);
+      graphics.fillTriangle(flagX, flagY - 18, flagX + 22, flagY, flagX, flagY + 18);
+      graphics.lineStyle(3, 0xffffff, 0.95);
+      graphics.lineBetween(flagX - 10, flagY - 24, flagX - 10, flagY + 26);
+    }
+    if (state.slowZones) {
+      for (const zone of state.slowZones.values()) {
+        if (!zone) continue;
+        const zx = this.toScreenX(zone.x);
+        const zy = this.toScreenY(zone.y);
+        const zr = this.toScreenRadius(zone.radius);
+        graphics.fillStyle(0x44cfff, 0.12);
+        graphics.fillCircle(zx, zy, zr);
+        graphics.lineStyle(2, 0x44cfff, 0.35);
+        graphics.strokeCircle(zx, zy, zr);
+      }
+    }
+
+    graphics.lineStyle(2, theme.grid, 1);
+    const view = this.cameraViewWorld;
+    const gridStep = 320;
+    const startX = Math.floor(view.left / gridStep) * gridStep;
+    const endX = view.left + view.width;
+    for (let x = startX; x <= endX; x += gridStep) {
+      const sx = this.toScreenX(x);
+      graphics.lineBetween(sx, 0, sx, height);
+    }
+    const startY = Math.floor(view.top / gridStep) * gridStep;
+    const endY = view.top + view.height;
+    for (let y = startY; y <= endY; y += gridStep) {
+      const sy = this.toScreenY(y);
+      graphics.lineBetween(0, sy, width, sy);
+    }
+    this.drawVisibleArenaBorder(graphics, width, height, state);
+  }
+
+  private drawVisibleArenaBorder(
+    graphics: Phaser.GameObjects.Graphics,
+    screenWidth: number,
+    screenHeight: number,
+    state: ArenaState,
+  ): void {
+    if (state.gameMode === "ffa") {
+      const playR = FFA_OCTAGON_RADIUS - PLAYER_RADIUS;
+      const ov = octagonVertices(FFA_OCTAGON_CENTER_X, FFA_OCTAGON_CENTER_Y, playR);
+      graphics.lineStyle(VIEWPORT_BORDER_WIDTH, VIEWPORT_BORDER_COLOR, VIEWPORT_BORDER_ALPHA);
+      const ix0 = this.toScreenX(ov[0]!.x);
+      const iy0 = this.toScreenY(ov[0]!.y);
+      graphics.beginPath();
+      graphics.moveTo(ix0, iy0);
+      for (let i = 1; i < ov.length; i += 1) {
+        const p = ov[i]!;
+        graphics.lineTo(this.toScreenX(p.x), this.toScreenY(p.y));
+      }
+      graphics.closePath();
+      graphics.strokePath();
+      return;
+    }
+    const worldMinX = PLAYER_RADIUS;
+    const worldMinY = PLAYER_RADIUS;
+    const worldMaxX = ARENA_WIDTH - PLAYER_RADIUS;
+    const worldMaxY = ARENA_HEIGHT - PLAYER_RADIUS;
+
+    const left = this.toScreenX(worldMinX);
+    const top = this.toScreenY(worldMinY);
+    const right = this.toScreenX(worldMaxX);
+    const bottom = this.toScreenY(worldMaxY);
+
+    const borderWidth = VIEWPORT_BORDER_WIDTH;
+    graphics.fillStyle(VIEWPORT_BORDER_COLOR, VIEWPORT_BORDER_ALPHA);
+
+    const visibleYTop = Phaser.Math.Clamp(top, 0, screenHeight);
+    const visibleYBottom = Phaser.Math.Clamp(bottom, 0, screenHeight);
+    const visibleXLeft = Phaser.Math.Clamp(left, 0, screenWidth);
+    const visibleXRight = Phaser.Math.Clamp(right, 0, screenWidth);
+    const visibleHeight = visibleYBottom - visibleYTop;
+    const visibleWidth = visibleXRight - visibleXLeft;
+
+    // Draw only the map edges that are currently visible in camera view.
+    if (left >= 0 && left <= screenWidth && visibleHeight > 0) {
+      graphics.fillRect(left - borderWidth * 0.5, visibleYTop, borderWidth, visibleHeight);
+    }
+    if (right >= 0 && right <= screenWidth && visibleHeight > 0) {
+      graphics.fillRect(right - borderWidth * 0.5, visibleYTop, borderWidth, visibleHeight);
+    }
+    if (top >= 0 && top <= screenHeight && visibleWidth > 0) {
+      graphics.fillRect(visibleXLeft, top - borderWidth * 0.5, visibleWidth, borderWidth);
+    }
+    if (bottom >= 0 && bottom <= screenHeight && visibleWidth > 0) {
+      graphics.fillRect(visibleXLeft, bottom - borderWidth * 0.5, visibleWidth, borderWidth);
+    }
+  }
+
+  private applyResponsiveCamera(): void {
+    this.lastArenaBackdropKey = "";
+    this.cameras.main.setViewport(0, 0, this.scale.width, this.scale.height);
+    if (this.restartButton) {
+      this.restartButton.setPosition(this.scale.width * 0.5, this.scale.height * 0.62);
+    }
+    if (this.countdownText) {
+      this.countdownText.setPosition(this.scale.width * 0.5, this.scale.height * 0.42);
+    }
+    if (this.leaderboardText) {
+      this.leaderboardText.setPosition(this.scale.width - 18, 22);
+    }
+  }
+
+  private pruneMap<T>(map: Map<string, T>, seen: Set<string>, destroy: (value: T) => void): void {
+    for (const [id, value] of map.entries()) {
+      if (!seen.has(id)) {
+        destroy(value);
+        map.delete(id);
+      }
+    }
+  }
+
+  private getLocalPlayer(): PlayerState | undefined {
+    const room = this.netClient.room;
+    if (!room?.state?.players) {
+      return undefined;
+    }
+
+    const bySessionId = room.state.players.get(room.sessionId);
+    if (bySessionId) {
+      return bySessionId;
+    }
+
+    // Some runtime serializers may not preserve map keys as expected.
+    for (const player of room.state.players.values()) {
+      if (player?.id === room.sessionId) {
+        return player;
+      }
+    }
+
+    return undefined;
+  }
+
+  private captureInput(): InputState {
+    const moveX = Number(this.keys.D.isDown || this.keys.RIGHT.isDown) - Number(this.keys.A.isDown || this.keys.LEFT.isDown);
+    const moveY = Number(this.keys.S.isDown || this.keys.DOWN.isDown) - Number(this.keys.W.isDown || this.keys.UP.isDown);
+    const localPlayer = this.getLocalPlayer();
+    const pointer = this.input.activePointer;
+    const aimX = localPlayer ? pointer.x - this.toScreenX(localPlayer.x) : 1;
+    const aimY = localPlayer ? pointer.y - this.toScreenY(localPlayer.y) : 0;
+    const aimLength = Math.hypot(aimX, aimY) || 1;
+    return {
+      moveX: Phaser.Math.Clamp(moveX, -1, 1),
+      moveY: Phaser.Math.Clamp(moveY, -1, 1),
+      aimX: aimX / aimLength,
+      aimY: aimY / aimLength,
+      boost: this.keys.SPACE.isDown,
+      fire: this.pointerFire,
+    };
+  }
+
+  private updateHud(state: ArenaState): void {
+    const localPlayer = this.getLocalPlayer();
+    const remainingMs = Math.max(0, state.matchDurationMs - state.elapsedMs);
+    this.timerText.setText(`TIME ${Math.ceil(remainingMs / 1000)}`);
+    this.updateCountdownText(state);
+
+    if (!localPlayer) {
+      this.statusText.setText("Joining…");
+      this.leaderboardText.setText("");
+      this.leaderboardPanel.clear();
+      return;
+    }
+    this.statusText.setText("");
+
+    const neutral = this.getNeutralFlag(state);
+    const carrierId = neutral?.carrierId ?? "";
+    if (carrierId === localPlayer.id && !this.prevFlagCarrierId) {
+      this.sfx.flagPickup();
+    }
+    if (this.prevFlagCarrierId && carrierId === localPlayer.id && this.prevFlagCarrierId !== localPlayer.id) {
+      this.sfx.flagStolen();
+    }
+    this.prevFlagCarrierId = carrierId;
+
+    const sorted = [...state.players.values()].sort((a, b) => b.wins - a.wins || b.score - a.score);
+    const lines: string[] = ["#  Name           W"];
+    const maxRows = Math.min(10, sorted.length);
+    for (let i = 0; i < maxRows; i += 1) {
+      const p = sorted[i]!;
+      const rank = i + 1;
+      const mark = p.id === localPlayer.id ? "›" : " ";
+      const raw = (p.name || "—").trim() || "—";
+      const name = raw.length > 13 ? `${raw.slice(0, 12)}…` : raw.padEnd(13, " ");
+      const w = Number.isFinite(p.wins) ? p.wins : 0;
+      lines.push(`${mark}${rank}  ${name} ${w}`);
+    }
+    this.leaderboardText.setText(lines.join("\n"));
+
+    const pad = 11;
+    const b = this.leaderboardText.getBounds();
+    const panel = this.leaderboardPanel;
+    panel.clear();
+    panel.fillStyle(0x0a1328, 0.94);
+    panel.fillRoundedRect(b.x - pad, b.y - pad, b.width + pad * 2, b.height + pad * 2, 10);
+    panel.lineStyle(2.2, 0x7ec8ff, 0.65);
+    panel.strokeRoundedRect(b.x - pad, b.y - pad, b.width + pad * 2, b.height + pad * 2, 10);
+    panel.lineStyle(1, 0xffe8a3, 0.22);
+    panel.strokeRoundedRect(b.x - pad + 2, b.y - pad + 2, b.width + pad * 2 - 4, b.height + pad * 2 - 4, 8);
+
+    const sortedByScore = [...state.players.values()].sort((a, b) => b.score - a.score);
+    const rank = Math.max(1, sortedByScore.findIndex((player) => player.id === localPlayer.id) + 1);
+    if (state.phase === "results" || remainingMs <= 0) {
+      if (rank <= 3) {
+        this.hideRestartButton();
+      } else {
+        this.showRestartButton();
+      }
+    } else {
+      this.hideRestartButton();
+    }
+  }
+
+  private toScreenX(worldX: number): number { return (worldX - this.cameraViewWorld.left) * this.cameraViewWorld.scale; }
+
+  private toScreenY(worldY: number): number { return (worldY - this.cameraViewWorld.top) * this.cameraViewWorld.scale; }
+
+  private toScreenRadius(worldRadius: number): number { return worldRadius * this.cameraViewWorld.scale; }
+
+  private drawMinimap(state: ArenaState): void {
+    const g = this.minimapGraphics;
+    const pad = 18;
+    const baseMinX = PLAYER_RADIUS;
+    const baseMinY = PLAYER_RADIUS;
+    const baseMaxX = ARENA_WIDTH - PLAYER_RADIUS;
+    const baseMaxY = ARENA_HEIGHT - PLAYER_RADIUS;
+
+    if (state.gameMode === "ffa") {
+      const mapWidth = 276;
+      const mapHeight = 212;
+      const x = this.scale.width - mapWidth - pad;
+      const y = this.scale.height - mapHeight - pad;
+      const cx = x + mapWidth * 0.5;
+      const cy = y + mapHeight * 0.5;
+      const rScreen = Math.min(mapWidth, mapHeight) * 0.48 - 6;
+      const wx = (worldX: number) => cx + ((worldX - FFA_OCTAGON_CENTER_X) / FFA_OCTAGON_RADIUS) * rScreen;
+      const wy = (worldY: number) => cy + ((worldY - FFA_OCTAGON_CENTER_Y) / FFA_OCTAGON_RADIUS) * rScreen;
+      g.clear();
+      const playR = FFA_OCTAGON_RADIUS - PLAYER_RADIUS * 2;
+      const ovWorld = octagonVertices(FFA_OCTAGON_CENTER_X, FFA_OCTAGON_CENTER_Y, playR);
+      g.fillStyle(0x0a1128, 0.82);
+      g.beginPath();
+      g.moveTo(wx(ovWorld[0]!.x), wy(ovWorld[0]!.y));
+      for (let i = 1; i < ovWorld.length; i += 1) {
+        const p = ovWorld[i]!;
+        g.lineTo(wx(p.x), wy(p.y));
+      }
+      g.closePath();
+      g.fillPath();
+      g.lineStyle(2.4, 0xc6ceff, 0.48);
+      g.beginPath();
+      g.moveTo(wx(ovWorld[0]!.x), wy(ovWorld[0]!.y));
+      for (let i = 1; i < ovWorld.length; i += 1) {
+        const p = ovWorld[i]!;
+        g.lineTo(wx(p.x), wy(p.y));
+      }
+      g.closePath();
+      g.strokePath();
+      const bases = ffaBaseCenters(FFA_OCTAGON_CENTER_X, FFA_OCTAGON_CENTER_Y, FFA_OCTAGON_RADIUS, 0.11);
+      OCTAGON_SANDBOX_BASE_SLOTS.forEach(({ team, vertexIndex }) => {
+        const c = bases[vertexIndex];
+        if (!c) return;
+        g.fillStyle(TEAM_COLORS[team] ?? 0xffffff, 0.55);
+        g.fillCircle(wx(c.x), wy(c.y), 4.5);
+      });
+      for (const player of state.players.values()) {
+        const px = wx(player.x);
+        const py = wy(player.y);
+        const color = TEAM_COLORS[player.team] ?? 0xffffff;
+        g.fillStyle(color, player.alive ? 0.95 : 0.35);
+        g.fillCircle(px, py, 2.8);
+      }
+      g.lineStyle(1.5, 0xc6ceff, 0.45);
+      g.strokeCircle(wx(state.captureX), wy(state.captureY), (state.captureRadius / FFA_OCTAGON_RADIUS) * rScreen);
+      const neutral = this.getNeutralFlag(state);
+      if (neutral && !neutral.carrierId) {
+        const fx = wx(neutral.x);
+        const fy = wy(neutral.y);
+        g.fillStyle(0xfff46b, 0.95);
+        g.fillTriangle(fx, fy - 4, fx + 5, fy + 3, fx - 5, fy + 3);
+      } else if (neutral?.carrierId) {
+        const carrier = state.players.get(neutral.carrierId);
+        if (carrier?.alive) {
+          const fx = wx(carrier.x);
+          const fy = wy(carrier.y);
+          const ping = state.neutralCarrierPing;
+          const pulse = ping ? 1 + 0.35 * Math.sin(this.time.now * 0.012) : 1;
+          const half = (ping ? 5.5 : 3) * pulse;
+          g.fillStyle(0xfff46b, 1);
+          g.fillRect(fx - half, fy - half, half * 2, half * 2);
+          g.lineStyle(ping ? 2 : 1, 0xff4444, ping ? 1 : 1);
+          g.strokeRect(fx - half, fy - half, half * 2, half * 2);
+        }
+      }
+      return;
+    }
+
+    const mapWidth = 220;
+    const mapHeight = 150;
+    const x = this.scale.width - mapWidth - pad;
+    const y = this.scale.height - mapHeight - pad;
+    g.clear();
+    g.fillStyle(0x0a1128, 0.75);
+    g.fillRect(x, y, mapWidth, mapHeight);
+    g.lineStyle(2, 0xffffff, 0.25);
+    g.strokeRect(x, y, mapWidth, mapHeight);
+    this.drawMinimapZone(g, x, y, mapWidth, mapHeight, baseMinX, baseMinY, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, TEAM_COLORS["red"]);
+    this.drawMinimapZone(g, x, y, mapWidth, mapHeight, baseMaxX - SAFE_ZONE_SIZE, baseMinY, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, TEAM_COLORS["blue"]);
+    this.drawMinimapZone(g, x, y, mapWidth, mapHeight, baseMinX, baseMaxY - SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, TEAM_COLORS["green"]);
+    this.drawMinimapZone(
+      g,
+      x,
+      y,
+      mapWidth,
+      mapHeight,
+      baseMaxX - SAFE_ZONE_SIZE,
+      baseMaxY - SAFE_ZONE_SIZE,
+      SAFE_ZONE_SIZE,
+      SAFE_ZONE_SIZE,
+      TEAM_COLORS["yellow"],
+    );
+
+    for (const player of state.players.values()) {
+      const px = x + (player.x / ARENA_WIDTH) * mapWidth;
+      const py = y + (player.y / ARENA_HEIGHT) * mapHeight;
+      const color = TEAM_COLORS[player.team] ?? 0xffffff;
+      g.fillStyle(color, player.alive ? 0.95 : 0.35);
+      g.fillCircle(px, py, 2.5);
+    }
+    g.lineStyle(1.5, 0xc6ceff, 0.45);
+    g.strokeCircle(
+      x + (state.captureX / ARENA_WIDTH) * mapWidth,
+      y + (state.captureY / ARENA_HEIGHT) * mapHeight,
+      (state.captureRadius / ARENA_WIDTH) * mapWidth,
+    );
+
+    const neutral = this.getNeutralFlag(state);
+    if (neutral && !neutral.carrierId) {
+      const fx = x + (neutral.x / ARENA_WIDTH) * mapWidth;
+      const fy = y + (neutral.y / ARENA_HEIGHT) * mapHeight;
+      g.fillStyle(0xfff46b, 0.95);
+      g.fillTriangle(fx, fy - 4, fx + 5, fy + 3, fx - 5, fy + 3);
+    } else if (neutral?.carrierId) {
+      const carrier = state.players.get(neutral.carrierId);
+      if (carrier?.alive) {
+        const fx = x + (carrier.x / ARENA_WIDTH) * mapWidth;
+        const fy = y + (carrier.y / ARENA_HEIGHT) * mapHeight;
+        const ping = state.neutralCarrierPing;
+        const pulse = ping ? 1 + 0.35 * Math.sin(this.time.now * 0.012) : 1;
+        const half = (ping ? 5.5 : 3) * pulse;
+        g.fillStyle(0xfff46b, 1);
+        g.fillRect(fx - half, fy - half, half * 2, half * 2);
+        g.lineStyle(ping ? 2 : 1, 0xff4444, ping ? 1 : 1);
+        g.strokeRect(fx - half, fy - half, half * 2, half * 2);
+      }
+    }
+  }
+
+  private drawMinimapZone(
+    g: Phaser.GameObjects.Graphics,
+    mapX: number,
+    mapY: number,
+    mapW: number,
+    mapH: number,
+    worldX: number,
+    worldY: number,
+    worldW: number,
+    worldH: number,
+    color: number,
+  ): void {
+    const x = mapX + (worldX / ARENA_WIDTH) * mapW;
+    const y = mapY + (worldY / ARENA_HEIGHT) * mapH;
+    const w = (worldW / ARENA_WIDTH) * mapW;
+    const h = (worldH / ARENA_HEIGHT) * mapH;
+    g.fillStyle(color, 0.18);
+    g.fillRect(x, y, w, h);
+    g.lineStyle(1.2, color, 0.7);
+    g.strokeRect(x, y, w, h);
+  }
+
+  private getNeutralFlag(state: ArenaState): FlagState | undefined {
+    return state.flags.get("flag-neutral");
+  }
+
+  private checkLocalProjectileBlasts(state: ArenaState): void {
+    const local = this.getLocalPlayer();
+    if (!local?.alive) return;
+    const current = state.projectiles;
+    for (const [id, snap] of this.projectileSnapshot.entries()) {
+      if (current.has(id)) continue;
+      const d = Math.hypot(local.x - snap.x, local.y - snap.y);
+      if (d > PROJECTILE_EXPLOSION_RADIUS) continue;
+      const directRadius = PLAYER_RADIUS + snap.radius;
+      this.onLocalBlastFeedback(d <= directRadius);
+    }
+  }
+
+  private onLocalBlastFeedback(direct: boolean): void {
+    const local = this.getLocalPlayer();
+    if (direct) {
+      this.sfx.blastDirect();
+      this.cameras.main.shake(90, 0.0018);
+    } else {
+      this.sfx.blastNear();
+    }
+    const cx = this.toScreenX(local?.x ?? 0);
+    const cy = this.toScreenY(local?.y ?? 0);
+    const color = direct ? 0xff9a6a : 0xa3c4ff;
+    const ring = this.add.circle(cx, cy, direct ? 48 : 28, color, 0.35).setDepth(125);
+    this.tweens.add({
+      targets: ring,
+      alpha: 0,
+      scaleX: direct ? 2.4 : 2.9,
+      scaleY: direct ? 2.4 : 2.9,
+      duration: direct ? 220 : 280,
+      onComplete: () => ring.destroy(),
+    });
+  }
+
+  private refreshProjectileSnapshot(state: ArenaState): void {
+    this.projectileSnapshot.clear();
+    for (const [id, projectile] of state.projectiles.entries()) {
+      if (!projectile) continue;
+      this.projectileSnapshot.set(id, {
+        x: projectile.x,
+        y: projectile.y,
+        ownerId: projectile.ownerId,
+        radius: projectile.radius,
+      });
+    }
+  }
+
+  private drawScreenObjectiveOverlay(state: ArenaState): void {
+    this.dangerOverlay.clear();
+    this.objectiveScreenGraphics.clear();
+    const local = this.getLocalPlayer();
+    if (!local?.alive || state.phase !== "live") {
+      this.objectiveFlagLabel.setVisible(false);
+      return;
+    }
+
+    const w = this.scale.width;
+    const h = this.scale.height;
+    if (isInEnemySafeZone(local.x, local.y, local.team, state)) {
+      const dangerPulse = 0.07 + 0.06 * Math.sin(this.time.now * 0.005);
+      this.dangerOverlay.fillStyle(0xff1c3a, dangerPulse);
+      this.dangerOverlay.fillRect(0, 0, w, h);
+    }
+
+    const { x: tx, y: ty } = getObjectiveWorldTarget(state, local);
+    const tsx = this.toScreenX(tx);
+    const tsy = this.toScreenY(ty);
+    const marker = objectiveScreenMarker(w, h, tsx, tsy, 32);
+    const cx = w * 0.5;
+    const cy = h * 0.5;
+    const angle = Math.atan2(tsy - cy, tsx - cx);
+    const g = this.objectiveScreenGraphics;
+    const arrowPulse = 1 + 0.08 * Math.sin(this.time.now * 0.006);
+    const baseR = marker.offScreen ? 34 : 26;
+    const r = baseR * arrowPulse;
+    const ax = marker.drawX + Math.cos(angle) * r;
+    const ay = marker.drawY + Math.sin(angle) * r;
+    const wing = r * 0.72;
+    const bx = marker.drawX + Math.cos(angle + 2.35) * wing;
+    const by = marker.drawY + Math.sin(angle + 2.35) * wing;
+    const cx2 = marker.drawX + Math.cos(angle - 2.35) * wing;
+    const cy2 = marker.drawY + Math.sin(angle - 2.35) * wing;
+
+    const glowR = r * 1.35;
+    const gax = marker.drawX + Math.cos(angle) * glowR;
+    const gay = marker.drawY + Math.sin(angle) * glowR;
+    const gwing = glowR * 0.72;
+    const gbx = marker.drawX + Math.cos(angle + 2.35) * gwing;
+    const gby = marker.drawY + Math.sin(angle + 2.35) * gwing;
+    const gcx2 = marker.drawX + Math.cos(angle - 2.35) * gwing;
+    const gcy2 = marker.drawY + Math.sin(angle - 2.35) * gwing;
+    g.fillStyle(0xff9500, 0.45);
+    g.fillTriangle(gax, gay, gbx, gby, gcx2, gcy2);
+
+    g.fillStyle(0xffee66, marker.offScreen ? 1 : 0.92);
+    g.fillTriangle(ax, ay, bx, by, cx2, cy2);
+    g.lineStyle(4, 0x1a0f28, 0.92);
+    g.beginPath();
+    g.moveTo(ax, ay);
+    g.lineTo(bx, by);
+    g.lineTo(cx2, cy2);
+    g.closePath();
+    g.strokePath();
+    g.lineStyle(2, 0xffffff, 0.88);
+    g.beginPath();
+    g.moveTo(ax, ay);
+    g.lineTo(bx, by);
+    g.lineTo(cx2, cy2);
+    g.closePath();
+    g.strokePath();
+
+    const triCenterX = (ax + bx + cx2) / 3;
+    const triBottomY = Math.max(ay, by, cy2);
+    const triTopY = Math.min(ay, by, cy2);
+    const gap = 10;
+    const edgePad = 14;
+    const halfW = Math.max(this.objectiveFlagLabel.displayWidth * 0.5, 28);
+    const halfH = Math.max(this.objectiveFlagLabel.displayHeight * 0.5, 12);
+
+    let lx = triCenterX;
+    let ly = triBottomY + gap + halfH * 0.35;
+    if (ly + halfH > h - edgePad) {
+      ly = triTopY - gap - halfH * 0.35;
+    }
+    lx = Phaser.Math.Clamp(lx, edgePad + halfW, w - edgePad - halfW);
+    ly = Phaser.Math.Clamp(ly, edgePad + halfH, h - edgePad - halfH);
+
+    this.objectiveFlagLabel.setPosition(lx, ly);
+    this.objectiveFlagLabel.setVisible(true);
+  }
+
+  private drawSafeZoneRect(
+    graphics: Phaser.GameObjects.Graphics,
+    worldX: number,
+    worldY: number,
+    worldW: number,
+    worldH: number,
+    team: "red" | "blue" | "green" | "yellow",
+    pulseMs: number,
+  ): void {
+    const sx = this.toScreenX(worldX);
+    const sy = this.toScreenY(worldY);
+    const sw = worldW * this.cameraViewWorld.scale;
+    const sh = worldH * this.cameraViewWorld.scale;
+    graphics.fillStyle(TEAM_COLORS[team], 0.16);
+    graphics.fillRect(sx, sy, sw, sh);
+    const edgePulse = 0.62 + 0.38 * Math.sin(pulseMs * 0.003 + worldX * 0.0004 + worldY * 0.0003);
+    graphics.lineStyle(4, TEAM_COLORS[team], edgePulse);
+    graphics.strokeRect(sx, sy, sw, sh);
+    graphics.lineStyle(2, 0xffffff, 0.22 + 0.2 * edgePulse);
+    graphics.strokeRect(sx + 3 * this.cameraViewWorld.scale, sy + 3 * this.cameraViewWorld.scale, sw - 6 * this.cameraViewWorld.scale, sh - 6 * this.cameraViewWorld.scale);
+  }
+
+  private updateCameraViewWorld(delta: number): void {
+    const localPlayer = this.getLocalPlayer();
+    const targetX = localPlayer?.x ?? ARENA_WIDTH * 0.5;
+    const targetY = localPlayer?.y ?? ARENA_HEIGHT * 0.5;
+    const scale = this.scale.width / CAMERA_VIEW_WIDTH_WORLD;
+    const viewWidth = this.scale.width / scale;
+    const viewHeight = this.scale.height / scale;
+    const maxLeft = Math.max(0, ARENA_WIDTH - viewWidth);
+    const maxTop = Math.max(0, ARENA_HEIGHT - viewHeight);
+
+    const minIdealX = viewWidth * 0.5;
+    const maxIdealX = ARENA_WIDTH - viewWidth * 0.5;
+    const minIdealY = viewHeight * 0.5;
+    const maxIdealY = ARENA_HEIGHT - viewHeight * 0.5;
+    const idealFocusX = maxIdealX >= minIdealX ? Phaser.Math.Clamp(targetX, minIdealX, maxIdealX) : ARENA_WIDTH * 0.5;
+    const idealFocusY = maxIdealY >= minIdealY ? Phaser.Math.Clamp(targetY, minIdealY, maxIdealY) : ARENA_HEIGHT * 0.5;
+
+    if (localPlayer) {
+      this.cameraFocusX = idealFocusX;
+      this.cameraFocusY = idealFocusY;
+    } else {
+      const alpha = Math.min(1, delta / 130);
+      this.cameraFocusX = Phaser.Math.Linear(this.cameraFocusX, idealFocusX, alpha);
+      this.cameraFocusY = Phaser.Math.Linear(this.cameraFocusY, idealFocusY, alpha);
+    }
+
+    const left = Phaser.Math.Clamp(this.cameraFocusX - viewWidth * 0.5, 0, maxLeft);
+    const top = Phaser.Math.Clamp(this.cameraFocusY - viewHeight * 0.5, 0, maxTop);
+    this.cameraViewWorld = { left, top, width: viewWidth, height: viewHeight, scale };
+  }
+
+  private createPlayerVisual(color: number): Phaser.GameObjects.Container {
+    const body = this.add.circle(0, 0, PLAYER_BODY_RADIUS_PX, color, 0.96).setStrokeStyle(3, 0xffffff, 0.95);
+    const nose = this.add.triangle(36, 0, 0, 0, -24, -14, -24, 14, 0xffffff, 0.95);
+    const carrierRing = this.add.circle(0, 0, 58, 0xfff46b, 0.14).setStrokeStyle(4, 0xfff46b, 0.95).setVisible(false);
+    return this.add.container(0, 0, [body, nose, carrierRing]).setDepth(40);
+  }
+
+  private createPickupVisual(kind: PickupState["kind"]): Phaser.GameObjects.Container {
+    const color = PICKUP_COLORS[kind] ?? 0xffffff;
+    const outerGlow = this.add.circle(0, 0, 18, color, 0.2).setStrokeStyle(2, color, 0.65);
+    const core = this.add.circle(0, 0, 11, color, 0.95).setStrokeStyle(2, 0xffffff, 0.95);
+    const icon = this.add
+      .text(0, 0, PICKUP_LABELS[kind] ?? "?", this.textStyle(14, "#0f1432"))
+      .setOrigin(0.5)
+      .setDepth(1);
+    return this.add.container(0, 0, [outerGlow, core, icon]).setDepth(30);
+  }
+
+  private updateCountdownText(state: ArenaState): void {
+    if (state.phase !== "countdown") {
+      this.countdownText.setStyle(this.textStyle(92, "#ffffff"));
+      this.countdownText.setText("");
+      return;
+    }
+    const seconds = Math.ceil(state.countdownMs / 1000);
+    this.countdownText.setStyle(this.textStyle(92, "#ffffff"));
+    this.countdownText.setText(seconds > 0 ? `${seconds}` : "GO");
+  }
+
+  private emitFlagTrail(player: PlayerState, color: number): void {
+    const lastAt = this.lastTrailAtMs.get(player.id) ?? 0;
+    if (this.time.now - lastAt < 88) return;
+    this.lastTrailAtMs.set(player.id, this.time.now);
+    const trail = this.add.circle(this.toScreenX(player.x), this.toScreenY(player.y), 10, color, 0.45).setDepth(22);
+    this.tweens.add({
+      targets: trail,
+      alpha: 0,
+      scaleX: 0.5,
+      scaleY: 0.5,
+      duration: 320,
+      onComplete: () => trail.destroy(),
+    });
+  }
+
+  private getCosmeticTier(score: number): number {
+    if (score >= PROGRESSION_MILESTONES[2]) return 3;
+    if (score >= PROGRESSION_MILESTONES[1]) return 2;
+    if (score >= PROGRESSION_MILESTONES[0]) return 1;
+    return 0;
+  }
+
+  private textStyle(size: number, color: string): Phaser.Types.GameObjects.Text.TextStyle {
+    return {
+      color,
+      fontFamily: "Arial",
+      fontSize: `${size}px`,
+      fontStyle: "700",
+    };
+  }
+
+  private showRestartButton(): void {
+    if (!this.restartButton || this.restarting) {
+      return;
+    }
+    this.restartButton.setVisible(true).setAlpha(1).setText("RESTART");
+    this.restartButton.setInteractive({ useHandCursor: true });
+  }
+
+  private hideRestartButton(): void {
+    if (!this.restartButton) {
+      return;
+    }
+    this.restartButton.setVisible(false).setAlpha(0);
+    this.restartButton.disableInteractive();
+  }
+
+  private async restartSession(): Promise<void> {
+    if (this.restarting) {
+      return;
+    }
+    this.restarting = true;
+    this.restartButton.setText("RESTARTING...").disableInteractive();
+    this.statusText.setText("Restarting…");
+    this.countdownText.setText("3");
+    // Reset local input throttle so post-restart countdown/input sync starts cleanly.
+    this.lastInputSentAt = 0;
+    this.netClient.requestRestart();
+    this.time.delayedCall(400, () => {
+      this.restarting = false;
+      this.hideRestartButton();
+      this.statusText.setText("");
+    });
+  }
+}
