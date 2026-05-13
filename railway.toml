@@ -1,0 +1,18 @@
+# Railway deployment for the multiplayer game server.
+# Only the `server` workspace is deployed here. The `client` is a static Vite app
+# that can be served from any host (CrazyGames, Netlify, etc.); the server only
+# needs `shared` + `server`, which is what this build does.
+
+[build]
+builder = "NIXPACKS"
+# `tsx` runs the TypeScript directly at startup, so we only need workspaces installed.
+# This sidesteps strict Node-ESM extension resolution (compiled .js imports don't carry
+# .js suffixes because tsconfig uses moduleResolution: "Bundler").
+buildCommand = "npm install --workspaces --include-workspace-root"
+
+[deploy]
+startCommand = "npx tsx server/src/index.ts"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

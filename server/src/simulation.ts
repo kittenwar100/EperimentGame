@@ -1,6 +1,8 @@
 import {
   ARENA_HEIGHT,
   ARENA_WIDTH,
+  BOOST_CHARGES_PER_LIFE,
+  BOOST_COOLDOWN_MS,
   BOOST_DURATION_MS,
   BOOST_SPEED_MULTIPLIER,
   CAPTURE_DURATION_MS,
@@ -10,6 +12,7 @@ import {
   ENDGAME_LAST_MS,
   FFA_FRENZY_AFTER_MS,
   FFA_MATCH_DURATION_MS,
+  FFA_TEAM_IDS,
   MATCH_DURATION_MS,
   MAX_BOTS,
   PICKUP_RESPAWN_MS,
@@ -32,7 +35,9 @@ import {
   SPIKE_COUNT,
   SPIKE_DRIFT_SPEED,
   SPIKE_RADIUS,
-  SPIKE_STUN_MS,
+  SPIKE_SLOW_DURATION_MS,
+  SPIKE_SLOW_MULTIPLIER,
+  SPIKE_PERM_SLOW_MULTIPLIER,
   SPEED_POWERUP_DURATION_MS,
   WORLD_EVENT_DURATION_MS,
   WORLD_EVENT_INTERVAL_MS,
@@ -44,6 +49,7 @@ import {
   ffaBaseCenters,
   pointInOctagon,
   octagonVertices,
+  type GameModeId,
   type Team,
   clamp,
   normalizeVector,
@@ -131,13 +137,22 @@ const MAP_LAYOUT_COUNT = 3;
 type BotRole = "attacker" | "defender" | "interceptor";
 type SafeZone = { team: Team; minX: number; minY: number; maxX: number; maxY: number };
 type FfaCircleZone = { team: string; cx: number; cy: number; r: number };
-/** Octagon FFA uses the same four teams as sandbox, one base per vertex (N, E, S, W style). */
-const OCTAGON_FFA_BASE_SLOTS: readonly { team: Team; vertexIndex: number }[] = [
-  { team: TEAM_RED, vertexIndex: 0 },
-  { team: TEAM_BLUE, vertexIndex: 2 },
-  { team: TEAM_GREEN, vertexIndex: 4 },
-  { team: TEAM_YELLOW, vertexIndex: 6 },
+/** Solo FFA: every player is on a unique team. One base at each of the 8 octagon vertices. */
+const OCTAGON_FFA_BASE_SLOTS: readonly { team: string; vertexIndex: number }[] = [
+  { team: "ffa0", vertexIndex: 0 },
+  { team: "ffa1", vertexIndex: 1 },
+  { team: "ffa2", vertexIndex: 2 },
+  { team: "ffa3", vertexIndex: 3 },
+  { team: "ffa4", vertexIndex: 4 },
+  { team: "ffa5", vertexIndex: 5 },
+  { team: "ffa6", vertexIndex: 6 },
+  { team: "ffa7", vertexIndex: 7 },
 ];
+/** Race mode rectangle layout: all players spawn in a left-side band; the flag sits on the right edge. */
+const RACE_SPAWN_BAND_MIN_X = PLAYER_RADIUS;
+const RACE_SPAWN_BAND_MAX_X = ARENA_WIDTH * 0.12;
+const RACE_FLAG_HOME_X = ARENA_WIDTH * 0.92;
+const RACE_FLAG_HOME_Y = ARENA_HEIGHT * 0.5;
 const FFA_SCORE_KEYS = [
   "ffa0Score",
   "ffa1Score",
@@ -223,8 +238,29 @@ export class GameSimulation {
     this.resetPickupDash();
   }
 
+  /** Solo FFA — the octagon layout, 8 unique teams (`ffa0..ffa7`) chasing one neutral flag. */
   private isFfa(): boolean {
     return this.state.gameMode === "ffa";
+  }
+
+  private isTeamCtf(): boolean {
+    return this.state.gameMode === "team_ctf";
+  }
+
+  private isRace(): boolean {
+    return this.state.gameMode === "race";
+  }
+
+  /** True when the active mode treats every player as their own team (solo FFA + race). */
+  private isSoloMode(): boolean {
+    return this.isFfa() || this.isRace();
+  }
+
+  /** Team ids that `pickBalancedTeam` is allowed to assign in the active mode. */
+  private getActiveTeams(): readonly string[] {
+    if (this.isFfa() || this.isRace()) return FFA_TEAM_IDS;
+    if (this.isTeamCtf()) return [TEAM_RED, TEAM_BLUE];
+    return TEAMS;
   }
 
   private getMatchDurationMs(): number {
@@ -325,7 +361,7 @@ export class GameSimulation {
     player.alive = true;
     const spawn = isBot
       ? this.pickUniqueBotEdgeSpawnPoint()
-      : this.isFfa()
+      : this.isSoloMode() || this.isTeamCtf()
         ? this.pickTeamBaseSpawnPoint(player)
         : this.pickSpawnPoint(undefined, false);
     player.x = spawn.x;
@@ -353,6 +389,10 @@ export class GameSimulation {
     player.challengeSteals = 0;
     player.challengeTier = 0;
     player.wins = 0;
+    player.spikeSlowMs = 0;
+    player.spikePermSlow = false;
+    player.boostCharges = BOOST_CHARGES_PER_LIFE;
+    player.boostCooldownMs = 0;
     this.state.players.set(id, player);
   }
 
@@ -550,9 +590,19 @@ export class GameSimulation {
       }
 
       const input = player.isBot ? this.createBotInput(player) : this.inputs.get(player.id) ?? EMPTY_INPUT;
+      const wasBoosting = player.boostMs > 0;
       player.boostMs = Math.max(0, player.boostMs - deltaMs);
+      // Releasing Space mid-boost ends the boost immediately and starts the cooldown.
+      if (wasBoosting && !input.boost && player.boostMs > 0) {
+        player.boostMs = 0;
+      }
+      if (wasBoosting && player.boostMs <= 0) {
+        player.boostCooldownMs = BOOST_COOLDOWN_MS;
+      }
+      player.boostCooldownMs = Math.max(0, player.boostCooldownMs - deltaMs);
       player.speedBoostMs = Math.max(0, player.speedBoostMs - deltaMs);
       player.stunnedMs = Math.max(0, player.stunnedMs - deltaMs);
+      player.spikeSlowMs = Math.max(0, player.spikeSlowMs - deltaMs);
       player.pushCooldownMs = Math.max(0, player.pushCooldownMs - deltaMs);
       player.basePerkMs = Math.max(0, player.basePerkMs - deltaMs);
       player.magnetMs = Math.max(0, player.magnetMs - deltaMs);
@@ -570,11 +620,15 @@ export class GameSimulation {
         !player.isBot && this.state.roundNumber === 1 && this.state.phase === "live"
           ? FIRST_ROUND_HUMAN_MOVE_MULTIPLIER
           : 1;
+      const spikeSlowFactor = player.spikeSlowMs > 0 ? SPIKE_SLOW_MULTIPLIER : 1;
+      const spikePermFactor = player.spikePermSlow ? SPIKE_PERM_SLOW_MULTIPLIER : 1;
       const speedFactor =
         PLAYER_SPEED_MULTIPLIER *
         midfieldBoost *
         powerupBoost *
         (player.boostMs > 0 ? BOOST_SPEED_MULTIPLIER : 1) *
+        spikeSlowFactor *
+        spikePermFactor *
         gravitySpeedBonus *
         firstRoundHumanBoost;
       const carriesNeutralFlag = this.getNeutralFlag()?.carrierId === player.id;
@@ -617,7 +671,15 @@ export class GameSimulation {
         }
       }
 
-      if (input.boost && player.boostMs <= 0) player.boostMs = BOOST_DURATION_MS;
+      if (
+        input.boost &&
+        player.boostMs <= 0 &&
+        player.boostCooldownMs <= 0 &&
+        player.boostCharges > 0
+      ) {
+        player.boostMs = BOOST_DURATION_MS;
+        player.boostCharges = Math.max(0, player.boostCharges - 1);
+      }
       const shotSpacingMs = this.isFfaFrenzy() ? 0 : PUSH_COOLDOWN_MS;
       if (input.fire && player.pushCooldownMs <= 0 && this.canFireProjectile(player)) {
         this.spawnProjectile(player, input);
@@ -652,8 +714,17 @@ export class GameSimulation {
       this.applyEnemySafeZoneBlocking(player);
       this.tryHitSpike(player);
       this.tryCollectPickup(player, previousX, previousY);
-      this.tryPickupNeutralFlag(player, previousX, previousY);
-      this.tryScoreNeutralFlag(player);
+      if (this.isTeamCtf()) {
+        this.tryPickupOrReturnFlags(player);
+        this.tryCaptureFlag(player);
+      } else {
+        this.tryPickupNeutralFlag(player, previousX, previousY);
+        if (this.isRace()) {
+          this.tryScoreRaceFlag(player);
+        } else {
+          this.tryScoreNeutralFlag(player);
+        }
+      }
       this.refreshBasePerkOnHomeEnter(player);
     }
   }
@@ -885,8 +956,13 @@ export class GameSimulation {
       flag.carryAgeMs = 0;
       this.state.neutralCarrierPing = false;
       if (flag.atBase) {
-        flag.homeX = this.state.captureX;
-        flag.homeY = this.state.captureY;
+        if (this.isRace()) {
+          flag.homeX = RACE_FLAG_HOME_X;
+          flag.homeY = RACE_FLAG_HOME_Y;
+        } else {
+          flag.homeX = this.state.captureX;
+          flag.homeY = this.state.captureY;
+        }
         flag.x = flag.homeX;
         flag.y = flag.homeY;
       }
@@ -911,7 +987,7 @@ export class GameSimulation {
       }
       return;
     }
-    const target = TARGET_BOT_COUNT_SANDBOX;
+    const target = this.getTargetBotCount(humanCount);
     const wantedBots = clamp(target, 0, MAX_BOTS);
     const botIds = [...this.state.players.keys()].filter((id) => id.startsWith(BOT_IDS));
 
@@ -924,6 +1000,14 @@ export class GameSimulation {
       const botId = botIds.pop();
       if (botId) this.removePlayer(botId);
     }
+  }
+
+  /** Bot backfill target. Solo FFA/race fill to 8 total. Team CTF fills to 8 total (4 vs 4). Sandbox keeps the legacy target. */
+  private getTargetBotCount(humanCount: number): number {
+    if (this.isFfa() || this.isRace() || this.isTeamCtf()) {
+      return Math.max(0, MAX_BOTS - humanCount);
+    }
+    return TARGET_BOT_COUNT_SANDBOX;
   }
 
   private jitterBotAim(dx: number, dy: number): { x: number; y: number } {
@@ -1043,13 +1127,13 @@ export class GameSimulation {
     this.state.projectiles.clear();
     this.initializePickups();
     this.initializeSpikes(this.mapLayoutIndex);
-    this.initializeNeutralFlag();
+    this.initializeFlagsForMode();
 
     for (const player of this.state.players.values()) {
       player.alive = true;
       const spawn = player.isBot
         ? this.pickUniqueBotEdgeSpawnPoint(player.id)
-        : this.isFfa()
+        : this.isSoloMode() || this.isTeamCtf()
           ? this.pickTeamBaseSpawnPoint(player)
           : this.pickSpawnPoint(player.id, false);
       player.x = spawn.x;
@@ -1070,8 +1154,61 @@ export class GameSimulation {
       player.shieldHits = 0;
       player.magnetMs = 0;
       player.repelMs = 0;
+      player.spikeSlowMs = 0;
+      player.spikePermSlow = false;
+      player.boostCharges = BOOST_CHARGES_PER_LIFE;
+      player.boostCooldownMs = 0;
       this.ammoRechargeAtMs.delete(player.id);
     }
+  }
+
+  /** Spawns the appropriate flags for the active mode: team flags for team_ctf, neutral for ffa/race/sandbox. */
+  private initializeFlagsForMode(): void {
+    if (this.isTeamCtf()) {
+      this.initializeTeamCtfFlags();
+    } else if (this.isRace()) {
+      this.initializeRaceFlag();
+    } else {
+      this.initializeNeutralFlag();
+    }
+  }
+
+  private initializeTeamCtfFlags(): void {
+    const redFlag = new FlagState();
+    redFlag.id = "flag-red";
+    redFlag.team = TEAM_RED;
+    redFlag.homeX = ARENA_WIDTH * 0.08;
+    redFlag.homeY = ARENA_HEIGHT * 0.5;
+    redFlag.x = redFlag.homeX;
+    redFlag.y = redFlag.homeY;
+    redFlag.carrierId = "";
+    redFlag.atBase = true;
+    this.state.flags.set(redFlag.id, redFlag);
+
+    const blueFlag = new FlagState();
+    blueFlag.id = "flag-blue";
+    blueFlag.team = TEAM_BLUE;
+    blueFlag.homeX = ARENA_WIDTH * 0.92;
+    blueFlag.homeY = ARENA_HEIGHT * 0.5;
+    blueFlag.x = blueFlag.homeX;
+    blueFlag.y = blueFlag.homeY;
+    blueFlag.carrierId = "";
+    blueFlag.atBase = true;
+    this.state.flags.set(blueFlag.id, blueFlag);
+  }
+
+  private initializeRaceFlag(): void {
+    const flag = new FlagState();
+    flag.id = NEUTRAL_FLAG_ID;
+    flag.team = "neutral";
+    flag.homeX = RACE_FLAG_HOME_X;
+    flag.homeY = RACE_FLAG_HOME_Y;
+    flag.x = flag.homeX;
+    flag.y = flag.homeY;
+    flag.carrierId = "";
+    flag.atBase = true;
+    flag.carryAgeMs = 0;
+    this.state.flags.set(flag.id, flag);
   }
 
   private endRoundFromTimeout(): void {
@@ -1269,12 +1406,9 @@ export class GameSimulation {
         const len = Math.hypot(dx, dy) || 1;
         player.vx += (dx / len) * 640;
         player.vy += (dy / len) * 640;
-        player.stunnedMs = 680;
-      } else {
-        player.stunnedMs = SPIKE_STUN_MS;
-        player.vx = 0;
-        player.vy = 0;
       }
+      player.spikeSlowMs = SPIKE_SLOW_DURATION_MS;
+      player.spikePermSlow = true;
       return;
     }
   }
@@ -1304,10 +1438,15 @@ export class GameSimulation {
         flag.y = player.y;
       }
     }
-    player.alive = false;
-    player.respawnMs = PLAYER_RESPAWN_MS;
     player.streak = 0;
     player.score = Math.max(0, player.score - 5);
+    // Solo FFA: respawn instantly at the player's own vertex base instead of running a death timer.
+    if (this.isSoloMode()) {
+      this.respawnPlayer(player);
+      return;
+    }
+    player.alive = false;
+    player.respawnMs = PLAYER_RESPAWN_MS;
   }
 
   private eliminateToTeamBase(player: PlayerState): void {
@@ -1316,7 +1455,7 @@ export class GameSimulation {
       this.resetNeutralFlag();
     }
     this.knockOutPlayer(player);
-    this.respawnPlayer(player);
+    if (!player.alive) this.respawnPlayer(player);
   }
 
   private respawnPlayer(player: PlayerState): void {
@@ -1330,6 +1469,10 @@ export class GameSimulation {
     player.vx = 0;
     player.vy = 0;
     player.stunnedMs = 0;
+    player.spikeSlowMs = 0;
+    player.boostCharges = BOOST_CHARGES_PER_LIFE;
+    player.boostCooldownMs = 0;
+    player.boostMs = 0;
     player.rotation = randomRange(-Math.PI, Math.PI);
   }
 
@@ -1339,6 +1482,12 @@ export class GameSimulation {
       if (c) {
         return { x: c.cx + randomRange(-36, 36), y: c.cy + randomRange(-36, 36) };
       }
+    }
+    if (this.isRace()) {
+      return {
+        x: randomRange(RACE_SPAWN_BAND_MIN_X + 60, RACE_SPAWN_BAND_MAX_X - 40),
+        y: randomRange(ARENA_HEIGHT * 0.1, ARENA_HEIGHT * 0.9),
+      };
     }
     const zone = SAFE_ZONES.find((candidate) => candidate.team === this.asTeam(player.team)) ?? SAFE_ZONES[0];
     if (!zone) return this.pickSpawnPoint(player.id, false);
@@ -1427,8 +1576,13 @@ export class GameSimulation {
       }
       return;
     }
+    // Race mode has a shared spawn band; no per-team safe zones to block.
+    if (this.isRace()) return;
+    const activeTeams = this.getActiveTeams();
     for (const zone of SAFE_ZONES) {
       if (zone.team === player.team) continue;
+      // Team CTF: only the active teams' safe zones are real walls; others are inert.
+      if (!activeTeams.includes(zone.team)) continue;
       const overlapsX = player.x > zone.minX && player.x < zone.maxX;
       const overlapsY = player.y > zone.minY && player.y < zone.maxY;
       if (!overlapsX || !overlapsY) continue;
@@ -1570,7 +1724,27 @@ export class GameSimulation {
     if (player.team === TEAM_BLUE) this.state.blueScore += add;
     if (player.team === TEAM_GREEN) this.state.greenScore += add;
     if (player.team === TEAM_YELLOW) this.state.yellowScore += add;
+    const ffaIndex = FFA_TEAM_IDS.indexOf(player.team as (typeof FFA_TEAM_IDS)[number]);
+    if (ffaIndex >= 0) {
+      const row = this.state as unknown as Record<string, number>;
+      const key = FFA_SCORE_KEYS[ffaIndex];
+      if (key) row[key] = (row[key] ?? 0) + add;
+    }
     player.score += (endgame ? 40 : 25) + (player.isBot ? 0 : HUMAN_FLAG_SCORE_BONUS);
+    player.wins += 1;
+    if (!player.isBot) {
+      player.challengeCaps += 1;
+      player.challengeTier = Math.floor(player.challengeCaps / 3);
+    }
+    this.startNextRound();
+  }
+
+  /** Race win: carrier crosses the left spawn band carrying the flag. Round ends, player.score gets a big bonus. */
+  private tryScoreRaceFlag(player: PlayerState): void {
+    const flag = this.getNeutralFlag();
+    if (!flag || flag.carrierId !== player.id) return;
+    if (player.x > RACE_SPAWN_BAND_MAX_X) return;
+    player.score += 100;
     player.wins += 1;
     if (!player.isBot) {
       player.challengeCaps += 1;
@@ -1596,12 +1770,13 @@ export class GameSimulation {
   }
 
   private pickBalancedTeam(): string {
-    const counts = new Map<Team, number>(TEAMS.map((team) => [team, 0]));
+    const active = this.getActiveTeams();
+    const counts = new Map<string, number>(active.map((team) => [team, 0]));
     for (const player of this.state.players.values()) {
-      const team = this.asTeam(player.team);
-      counts.set(team, (counts.get(team) ?? 0) + 1);
+      if (!counts.has(player.team)) continue;
+      counts.set(player.team, (counts.get(player.team) ?? 0) + 1);
     }
-    return [...TEAMS].sort((a, b) => (counts.get(a) ?? 0) - (counts.get(b) ?? 0))[0] ?? TEAM_RED;
+    return [...active].sort((a, b) => (counts.get(a) ?? 0) - (counts.get(b) ?? 0))[0] ?? TEAM_RED;
   }
 
   private spawnProjectile(source: PlayerState, input: InputState): void {
@@ -1903,6 +2078,9 @@ export class GameSimulation {
       const c = this.getFfaCircles().find((z) => z.team === team);
       if (c) return { x: c.cx, y: c.cy };
       return { x: FFA_OCTAGON_CENTER_X, y: FFA_OCTAGON_CENTER_Y };
+    }
+    if (this.isRace()) {
+      return { x: (RACE_SPAWN_BAND_MIN_X + RACE_SPAWN_BAND_MAX_X) * 0.5, y: ARENA_HEIGHT * 0.5 };
     }
     const teamT = this.asTeam(team);
     const zone = SAFE_ZONES.find((candidate) => candidate.team === teamT) ?? SAFE_ZONES[0];

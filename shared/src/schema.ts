@@ -18,6 +18,14 @@ export const PlayerState = schema({
   pushCooldownMs: "number",
   bulletCharges: "number",
   respawnMs: "number",
+  /** Ms remaining of the 10s 75% slow from a spike hit. */
+  spikeSlowMs: "number",
+  /** Set on first spike hit this round; capped at 25% permanent slow. Cleared on round restart. */
+  spikePermSlow: "boolean",
+  /** Boost charges remaining this life. Refilled to BOOST_CHARGES_PER_LIFE on respawn. */
+  boostCharges: "number",
+  /** Ms remaining of the post-boost cooldown. While > 0, boost cannot start. */
+  boostCooldownMs: "number",
   vehicleClass: "string",
   score: "number",
   streak: "number",

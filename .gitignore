@@ -5,3 +5,4 @@ coverage/
 *.log
 client/dist/
 server/dist/
+.claude/settings.local.json

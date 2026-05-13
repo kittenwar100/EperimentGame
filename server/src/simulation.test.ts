@@ -1,6 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ARENA_HEIGHT, ARENA_WIDTH, CAPTURE_DURATION_MS, ROUND_COUNTDOWN_MS } from "../../shared/src";
+import {
+  ARENA_HEIGHT,
+  ARENA_WIDTH,
+  BOOST_CHARGES_PER_LIFE,
+  BOOST_COOLDOWN_MS,
+  BOOST_DURATION_MS,
+  CAPTURE_DURATION_MS,
+  ROUND_COUNTDOWN_MS,
+  SPIKE_SLOW_DURATION_MS,
+} from "../../shared/src";
 import { ArenaState } from "./state";
 import { GameSimulation } from "./simulation";
 
@@ -238,6 +247,98 @@ test("direct projectile hit steals neutral flag from an enemy carrier", () => {
   simulation.update(220);
 
   assert.equal(neutral.carrierId, "human");
+});
+
+test("spike hit applies 10s slow and sets the permanent round penalty", () => {
+  const state = new ArenaState();
+  const simulation = new GameSimulation(state);
+  simulation.addPlayer("p1", "Walker");
+  simulation.update(ROUND_COUNTDOWN_MS);
+  const player = state.players.get("p1")!;
+  const firstSpike = state.spikes.values().next().value!;
+  firstSpike.spikeKind = "standard";
+  firstSpike.x = player.x;
+  firstSpike.y = player.y;
+  firstSpike.vx = 0;
+  firstSpike.vy = 0;
+
+  simulation.update(16);
+
+  assert.equal(player.spikePermSlow, true, "first spike hit should arm the permanent slow");
+  assert.equal(player.spikeSlowMs > 0, true, "first spike hit should set the 10s slow timer");
+  assert.equal(player.spikeSlowMs <= SPIKE_SLOW_DURATION_MS, true);
+  assert.equal(player.stunnedMs, 0, "new spike behavior must not stun");
+});
+
+test("boost requires a charge and starts a cooldown after the boost ends", () => {
+  const state = new ArenaState();
+  const simulation = new GameSimulation(state);
+  simulation.addPlayer("p1", "Booster");
+  simulation.update(ROUND_COUNTDOWN_MS);
+  const player = state.players.get("p1")!;
+  assert.equal(player.boostCharges, BOOST_CHARGES_PER_LIFE);
+
+  simulation.setInput("p1", { moveX: 0, moveY: 0, aimX: 1, aimY: 0, boost: true, fire: false });
+  simulation.update(16);
+  assert.equal(player.boostCharges, BOOST_CHARGES_PER_LIFE - 1, "starting a boost consumes one charge");
+  assert.equal(player.boostMs > 0, true, "boost timer should be running");
+
+  // Hold boost through the full duration; cooldown should kick in after.
+  simulation.update(BOOST_DURATION_MS + 32);
+  assert.equal(player.boostMs, 0, "boost should be drained");
+  assert.equal(player.boostCooldownMs > 0, true, "cooldown must start after boost ends");
+  assert.equal(player.boostCooldownMs <= BOOST_COOLDOWN_MS, true);
+
+  // Trying to boost again before cooldown expires must not consume a charge.
+  const chargesBefore = player.boostCharges;
+  simulation.setInput("p1", { moveX: 0, moveY: 0, aimX: 1, aimY: 0, boost: true, fire: false });
+  simulation.update(16);
+  assert.equal(player.boostCharges, chargesBefore, "boost must not start while cooldown is active");
+});
+
+test("releasing space mid-boost ends the boost immediately and starts the cooldown", () => {
+  const state = new ArenaState();
+  const simulation = new GameSimulation(state);
+  simulation.addPlayer("p1", "Booster");
+  simulation.update(ROUND_COUNTDOWN_MS);
+  const player = state.players.get("p1")!;
+
+  simulation.setInput("p1", { moveX: 0, moveY: 0, aimX: 1, aimY: 0, boost: true, fire: false });
+  simulation.update(500);
+  assert.equal(player.boostMs > 0, true);
+
+  simulation.setInput("p1", { moveX: 0, moveY: 0, aimX: 1, aimY: 0, boost: false, fire: false });
+  simulation.update(16);
+  assert.equal(player.boostMs, 0, "releasing space must end the boost");
+  assert.equal(player.boostCooldownMs > 0, true, "cooldown must engage when boost ends");
+});
+
+test("team_ctf only balances red/blue and fills bots to four-vs-four", () => {
+  const state = new ArenaState();
+  const simulation = new GameSimulation(state);
+  state.gameMode = "team_ctf";
+  simulation.addPlayer("h1", "Pilot");
+  simulation.update(16);
+  const teams = new Set([...state.players.values()].map((p) => p.team));
+  for (const team of teams) {
+    assert.equal(team === "red" || team === "blue", true, `team_ctf must not assign ${team}`);
+  }
+  assert.equal(state.players.size, 8, "team_ctf must backfill to 8 players (4v4)");
+});
+
+test("solo FFA assigns unique ffaN teams across 8 vertex bases", () => {
+  const state = new ArenaState();
+  const simulation = new GameSimulation(state);
+  state.gameMode = "ffa";
+  simulation.addPlayer("h1", "Pilot");
+  simulation.update(16);
+  const teams = [...state.players.values()].map((p) => p.team);
+  const unique = new Set(teams);
+  assert.equal(state.players.size, 8, "solo FFA fills to 8 players total");
+  assert.equal(unique.size, 8, "every player must be on a unique solo team id");
+  for (const team of teams) {
+    assert.equal(team.startsWith("ffa"), true, `expected ffaN team id, got ${team}`);
+  }
 });
 
 test("direct projectile hit does not steal flag from a teammate", () => {

@@ -20,8 +20,16 @@ export const PLAYER_RESPAWN_MS = 2500;
 export const PLAYER_BASE_ACCEL = 700;
 export const PLAYER_MAX_SPEED = 310;
 export const PLAYER_DRAG = 0.9985;
-export const BOOST_DURATION_MS = 1400;
-export const BOOST_SPEED_MULTIPLIER = 1.45;
+export const BOOST_DURATION_MS = 5000;
+export const BOOST_SPEED_MULTIPLIER = 2.0;
+export const BOOST_CHARGES_PER_LIFE = 4;
+export const BOOST_COOLDOWN_MS = 10_000;
+/** Spike slow lingers this long after a hit, at {@link SPIKE_SLOW_MULTIPLIER} of normal speed. */
+export const SPIKE_SLOW_DURATION_MS = 10_000;
+/** Speed factor while in the 10s spike slow window. 0.25 = 75% slower. */
+export const SPIKE_SLOW_MULTIPLIER = 0.25;
+/** Speed factor for the per-round permanent penalty after first spike hit. 0.75 = 25% slower. */
+export const SPIKE_PERM_SLOW_MULTIPLIER = 0.75;
 export const MAX_BOTS = 8;
 export const DESIRED_PLAYERS = 6;
 export const INPUT_SEND_RATE_MS = 50;
@@ -57,7 +65,8 @@ export interface InputState {
   fire: boolean;
 }
 
-export type GameModeId = "sandbox" | "ffa";
+/** `ffa` is solo FFA (octagon, 8 vertex bases). `team_ctf` is 2-team CTF (rectangle, red vs blue). `race` is 8-player rectangle race-to-the-flag. `sandbox` is an internal/dev mode. */
+export type GameModeId = "sandbox" | "ffa" | "team_ctf" | "race";
 
 export interface JoinOptions {
   name?: string;

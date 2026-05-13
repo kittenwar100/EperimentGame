@@ -2,6 +2,8 @@ import * as Phaser from "phaser";
 import {
   ARENA_HEIGHT,
   ARENA_WIDTH,
+  BOOST_CHARGES_PER_LIFE,
+  BOOST_COOLDOWN_MS,
   FFA_CORNER_BASE_ZONE_RADIUS,
   FFA_OCTAGON_CENTER_X,
   FFA_OCTAGON_CENTER_Y,
@@ -35,7 +37,14 @@ const PICKUP_COLORS: Record<string, number> = {
   magnet: 0xff9c5c,
   repel: 0xc07dff,
 };
-const PICKUP_LABELS: Record<string, string> = { speed: "S", ammo: "A", shield: "H", magnet: "M", repel: "R" };
+/** Short labels for the HUD legend / leaderboard panel (not drawn on the world pickup itself). */
+const PICKUP_LABELS: Record<string, string> = {
+  speed: "Overdrive",
+  ammo: "Recharge",
+  shield: "Shield",
+  magnet: "Magnet",
+  repel: "Repel",
+};
 const MAP_THEMES: Array<{ bg1: number; bg2: number; bg3: number; bg4: number; grid: number; ring: number; ringLine: number }> = [
   { bg1: 0x152238, bg2: 0x152238, bg3: 0x0c1830, bg4: 0x0c1830, grid: 0x2a4a72, ring: 0x2e4580, ringLine: 0xa3b2ff },
   { bg1: 0x1a1530, bg2: 0x1a1530, bg3: 0x100828, bg4: 0x100828, grid: 0x4a3a78, ring: 0x4a3a8a, ringLine: 0xd4b8ff },
@@ -55,13 +64,21 @@ const TEAM_COLORS: Record<string, number> = {
   ffa6: 0x5cf0ff,
   ffa7: 0xb8ff8a,
 };
-/** Same four teams / vertex pairing as server octagon FFA (sandbox rules). */
-const OCTAGON_SANDBOX_BASE_SLOTS: readonly { team: string; vertexIndex: number }[] = [
-  { team: "red", vertexIndex: 0 },
-  { team: "blue", vertexIndex: 2 },
-  { team: "green", vertexIndex: 4 },
-  { team: "yellow", vertexIndex: 6 },
+/** Solo FFA octagon: one base per vertex, one player per base (ffa0..ffa7). Mirrors the server's OCTAGON_FFA_BASE_SLOTS. */
+const OCTAGON_SOLO_FFA_SLOTS: readonly { team: string; vertexIndex: number }[] = [
+  { team: "ffa0", vertexIndex: 0 },
+  { team: "ffa1", vertexIndex: 1 },
+  { team: "ffa2", vertexIndex: 2 },
+  { team: "ffa3", vertexIndex: 3 },
+  { team: "ffa4", vertexIndex: 4 },
+  { team: "ffa5", vertexIndex: 5 },
+  { team: "ffa6", vertexIndex: 6 },
+  { team: "ffa7", vertexIndex: 7 },
 ];
+/** Race mode rectangle layout. Mirrors the server's RACE_* constants. */
+const RACE_SPAWN_BAND_MAX_X = ARENA_WIDTH * 0.12;
+const RACE_FLAG_HOME_X = ARENA_WIDTH * 0.92;
+const RACE_FLAG_HOME_Y = ARENA_HEIGHT * 0.5;
 const CAMERA_VIEW_WIDTH_WORLD = 1850;
 const PLAYER_BODY_RADIUS_PX = 32;
 const PLAYER_SIZE_MULTIPLIER = 2.5;
@@ -90,6 +107,8 @@ export class GameScene extends Phaser.Scene {
   private objectiveScreenGraphics!: Phaser.GameObjects.Graphics;
   private leaderboardPanel!: Phaser.GameObjects.Graphics;
   private objectiveFlagLabel!: Phaser.GameObjects.Text;
+  private boostHud!: Phaser.GameObjects.Graphics;
+  private boostHudText!: Phaser.GameObjects.Text;
   private statusText!: Phaser.GameObjects.Text;
   private positionText!: Phaser.GameObjects.Text;
   private timerText!: Phaser.GameObjects.Text;
@@ -268,18 +287,17 @@ export class GameScene extends Phaser.Scene {
     const visual = this.pickupVisuals.get(id) ?? this.createPickupVisual(pickup.kind);
     const outerGlow = visual.getAt(0) as Phaser.GameObjects.Arc;
     const core = visual.getAt(1) as Phaser.GameObjects.Arc;
-    const icon = visual.getAt(2) as Phaser.GameObjects.Text;
     const color = PICKUP_COLORS[pickup.kind] ?? 0xffffff;
     visual.x = this.toScreenX(pickup.x);
     visual.y = this.toScreenY(pickup.y);
     visual.setDepth(30);
     outerGlow.fillColor = color;
     core.fillColor = color;
-    icon.setText(PICKUP_LABELS[pickup.kind] ?? "?");
+    const pulse = 0.92 + 0.08 * Math.sin(this.time.now * 0.006 + pickup.x * 0.005);
     visual.alpha = pickup.active ? 0.98 : 0.2;
-    const pickupScale = this.toScreenRadius(PICKUP_RADIUS) / 18;
+    const pickupScale = (this.toScreenRadius(PICKUP_RADIUS) / 18) * pulse;
     visual.setScale(pickup.active ? pickupScale : pickupScale * 0.85);
-    visual.angle = (this.time.now * 0.08 + pickup.x * 0.04) % 360;
+    // Icon (child index 2) is a Graphics object, no rotation. Container itself stays upright for icon readability.
     this.pickupVisuals.set(id, visual);
   }
 
@@ -330,8 +348,10 @@ export class GameScene extends Phaser.Scene {
       .setStroke("#1a0f28", 7)
       .setVisible(false);
     this.timerText = this.add.text(24, 18, "TIME 0", this.textStyle(22, "#ffe95c"));
-    this.controlsText = this.add.text(24, 48, "WASD move | Left click blast | SPACE boost", this.textStyle(16, "#9fd7ff"));
+    this.controlsText = this.add.text(24, 48, "WASD move | Left click blast | Hold SPACE boost (4 charges, 10s cooldown)", this.textStyle(16, "#9fd7ff"));
     this.statusText = this.add.text(24, 100, "", this.textStyle(15, "#b8c4d8"));
+    this.boostHud = this.add.graphics();
+    this.boostHudText = this.add.text(24, 76, "", this.textStyle(14, "#9fd7ff"));
     this.positionText = this.add.text(-2000, -2000, "", this.textStyle(1, "#000000")).setVisible(false);
     this.objectiveText = this.add.text(-2000, -2000, "", this.textStyle(1, "#000000")).setVisible(false);
     this.leaderboardText = this.add
@@ -372,9 +392,11 @@ export class GameScene extends Phaser.Scene {
       this.leaderboardText,
       this.countdownText,
       this.restartButton,
+      this.boostHudText,
     ]) {
       text.setScrollFactor(0).setDepth(80);
     }
+    this.boostHud.setScrollFactor(0).setDepth(80);
     this.countdownText.setDepth(130);
     this.leaderboardText.setDepth(83);
   }
@@ -400,7 +422,7 @@ export class GameScene extends Phaser.Scene {
     const pulseT = this.time.now;
     if (state.gameMode === "ffa") {
       const insetBases = ffaBaseCenters(FFA_OCTAGON_CENTER_X, FFA_OCTAGON_CENTER_Y, FFA_OCTAGON_RADIUS, 0.11);
-      OCTAGON_SANDBOX_BASE_SLOTS.forEach(({ team, vertexIndex }, i) => {
+      OCTAGON_SOLO_FFA_SLOTS.forEach(({ team, vertexIndex }, i) => {
         const c = insetBases[vertexIndex];
         if (!c) return;
         const sx = this.toScreenX(c.x);
@@ -425,7 +447,29 @@ export class GameScene extends Phaser.Scene {
       }
       graphics.closePath();
       graphics.strokePath();
+    } else if (state.gameMode === "team_ctf") {
+      // 2 teams only: red at top-left, blue at bottom-right (matches server initializeTeamCtfFlags).
+      this.drawSafeZoneRect(graphics, baseMinX, baseMinY, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, "red", pulseT);
+      this.drawSafeZoneRect(graphics, baseMaxX - SAFE_ZONE_SIZE, baseMaxY - SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, "blue", pulseT);
+    } else if (state.gameMode === "race") {
+      // Shared spawn band on the left; flag base on the right.
+      const bandX = this.toScreenX(baseMinX);
+      const bandWidth = this.toScreenRadius(RACE_SPAWN_BAND_MAX_X - baseMinX);
+      const bandY = this.toScreenY(baseMinY);
+      const bandHeight = this.toScreenRadius(ARENA_HEIGHT - PLAYER_RADIUS * 2);
+      graphics.fillStyle(0x5cf0ff, 0.12);
+      graphics.fillRect(bandX, bandY, bandWidth, bandHeight);
+      graphics.lineStyle(3, 0x5cf0ff, 0.55 + 0.2 * Math.sin(pulseT * 0.003));
+      graphics.strokeRect(bandX, bandY, bandWidth, bandHeight);
+      const flagSx = this.toScreenX(RACE_FLAG_HOME_X);
+      const flagSy = this.toScreenY(RACE_FLAG_HOME_Y);
+      const flagSr = this.toScreenRadius(FFA_CORNER_BASE_ZONE_RADIUS * 0.7);
+      graphics.fillStyle(0xfff46b, 0.14);
+      graphics.fillCircle(flagSx, flagSy, flagSr);
+      graphics.lineStyle(3, 0xfff46b, 0.6 + 0.25 * Math.sin(pulseT * 0.0035));
+      graphics.strokeCircle(flagSx, flagSy, flagSr);
     } else {
+      // Sandbox fallback: 4-corner team zones.
       this.drawSafeZoneRect(graphics, baseMinX, baseMinY, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, "red", pulseT);
       this.drawSafeZoneRect(graphics, baseMaxX - SAFE_ZONE_SIZE, baseMinY, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, "blue", pulseT);
       this.drawSafeZoneRect(graphics, baseMinX, baseMaxY - SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, "green", pulseT);
@@ -618,9 +662,12 @@ export class GameScene extends Phaser.Scene {
       this.statusText.setText("Joining…");
       this.leaderboardText.setText("");
       this.leaderboardPanel.clear();
+      this.boostHud.clear();
+      this.boostHudText.setText("");
       return;
     }
     this.statusText.setText("");
+    this.drawBoostHud(localPlayer);
 
     const neutral = this.getNeutralFlag(state);
     const carrierId = neutral?.carrierId ?? "";
@@ -716,7 +763,7 @@ export class GameScene extends Phaser.Scene {
       g.closePath();
       g.strokePath();
       const bases = ffaBaseCenters(FFA_OCTAGON_CENTER_X, FFA_OCTAGON_CENTER_Y, FFA_OCTAGON_RADIUS, 0.11);
-      OCTAGON_SANDBOX_BASE_SLOTS.forEach(({ team, vertexIndex }) => {
+      OCTAGON_SOLO_FFA_SLOTS.forEach(({ team, vertexIndex }) => {
         const c = bases[vertexIndex];
         if (!c) return;
         g.fillStyle(TEAM_COLORS[team] ?? 0xffffff, 0.55);
@@ -763,21 +810,32 @@ export class GameScene extends Phaser.Scene {
     g.fillRect(x, y, mapWidth, mapHeight);
     g.lineStyle(2, 0xffffff, 0.25);
     g.strokeRect(x, y, mapWidth, mapHeight);
-    this.drawMinimapZone(g, x, y, mapWidth, mapHeight, baseMinX, baseMinY, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, TEAM_COLORS["red"]);
-    this.drawMinimapZone(g, x, y, mapWidth, mapHeight, baseMaxX - SAFE_ZONE_SIZE, baseMinY, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, TEAM_COLORS["blue"]);
-    this.drawMinimapZone(g, x, y, mapWidth, mapHeight, baseMinX, baseMaxY - SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, TEAM_COLORS["green"]);
-    this.drawMinimapZone(
-      g,
-      x,
-      y,
-      mapWidth,
-      mapHeight,
-      baseMaxX - SAFE_ZONE_SIZE,
-      baseMaxY - SAFE_ZONE_SIZE,
-      SAFE_ZONE_SIZE,
-      SAFE_ZONE_SIZE,
-      TEAM_COLORS["yellow"],
-    );
+    if (state.gameMode === "team_ctf") {
+      this.drawMinimapZone(g, x, y, mapWidth, mapHeight, baseMinX, baseMinY, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, TEAM_COLORS["red"]);
+      this.drawMinimapZone(g, x, y, mapWidth, mapHeight, baseMaxX - SAFE_ZONE_SIZE, baseMaxY - SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, TEAM_COLORS["blue"]);
+    } else if (state.gameMode === "race") {
+      this.drawMinimapZone(g, x, y, mapWidth, mapHeight, baseMinX, baseMinY, RACE_SPAWN_BAND_MAX_X - baseMinX, ARENA_HEIGHT - PLAYER_RADIUS * 2, 0x5cf0ff);
+      const fxw = x + (RACE_FLAG_HOME_X / ARENA_WIDTH) * mapWidth;
+      const fyw = y + (RACE_FLAG_HOME_Y / ARENA_HEIGHT) * mapHeight;
+      g.fillStyle(0xfff46b, 0.35);
+      g.fillCircle(fxw, fyw, 5);
+    } else {
+      this.drawMinimapZone(g, x, y, mapWidth, mapHeight, baseMinX, baseMinY, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, TEAM_COLORS["red"]);
+      this.drawMinimapZone(g, x, y, mapWidth, mapHeight, baseMaxX - SAFE_ZONE_SIZE, baseMinY, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, TEAM_COLORS["blue"]);
+      this.drawMinimapZone(g, x, y, mapWidth, mapHeight, baseMinX, baseMaxY - SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, SAFE_ZONE_SIZE, TEAM_COLORS["green"]);
+      this.drawMinimapZone(
+        g,
+        x,
+        y,
+        mapWidth,
+        mapHeight,
+        baseMaxX - SAFE_ZONE_SIZE,
+        baseMaxY - SAFE_ZONE_SIZE,
+        SAFE_ZONE_SIZE,
+        SAFE_ZONE_SIZE,
+        TEAM_COLORS["yellow"],
+      );
+    }
 
     for (const player of state.players.values()) {
       const px = x + (player.x / ARENA_WIDTH) * mapWidth;
@@ -1026,6 +1084,46 @@ export class GameScene extends Phaser.Scene {
     this.cameraViewWorld = { left, top, width: viewWidth, height: viewHeight, scale };
   }
 
+  private drawBoostHud(player: PlayerState): void {
+    const dotR = 7;
+    const gap = 6;
+    const startX = 24;
+    const y = 90;
+    const g = this.boostHud;
+    g.clear();
+    for (let i = 0; i < BOOST_CHARGES_PER_LIFE; i += 1) {
+      const cx = startX + dotR + i * (dotR * 2 + gap);
+      const filled = i < player.boostCharges;
+      if (filled) {
+        g.fillStyle(0xffe95c, 0.96);
+        g.fillCircle(cx, y, dotR);
+        g.lineStyle(2, 0xffffff, 0.85);
+        g.strokeCircle(cx, y, dotR);
+      } else {
+        g.lineStyle(2, 0xffe95c, 0.45);
+        g.strokeCircle(cx, y, dotR);
+      }
+    }
+    if (player.boostCooldownMs > 0) {
+      const ratio = Math.min(1, player.boostCooldownMs / BOOST_COOLDOWN_MS);
+      const barX = startX;
+      const barY = y + dotR + 6;
+      const barW = BOOST_CHARGES_PER_LIFE * (dotR * 2 + gap) - gap;
+      const barH = 4;
+      g.fillStyle(0x2a3458, 0.85);
+      g.fillRect(barX, barY, barW, barH);
+      g.fillStyle(0x66a6ff, 0.95);
+      g.fillRect(barX, barY, barW * (1 - ratio), barH);
+      this.boostHudText.setText(`Boost CD ${(player.boostCooldownMs / 1000).toFixed(1)}s`);
+    } else if (player.boostMs > 0) {
+      this.boostHudText.setText("Boosting…");
+    } else if (player.boostCharges === 0) {
+      this.boostHudText.setText("Boost depleted — respawn to refill");
+    } else {
+      this.boostHudText.setText("Hold SPACE to boost");
+    }
+  }
+
   private createPlayerVisual(color: number): Phaser.GameObjects.Container {
     const body = this.add.circle(0, 0, PLAYER_BODY_RADIUS_PX, color, 0.96).setStrokeStyle(3, 0xffffff, 0.95);
     const nose = this.add.triangle(36, 0, 0, 0, -24, -14, -24, 14, 0xffffff, 0.95);
@@ -1037,11 +1135,63 @@ export class GameScene extends Phaser.Scene {
     const color = PICKUP_COLORS[kind] ?? 0xffffff;
     const outerGlow = this.add.circle(0, 0, 18, color, 0.2).setStrokeStyle(2, color, 0.65);
     const core = this.add.circle(0, 0, 11, color, 0.95).setStrokeStyle(2, 0xffffff, 0.95);
-    const icon = this.add
-      .text(0, 0, PICKUP_LABELS[kind] ?? "?", this.textStyle(14, "#0f1432"))
-      .setOrigin(0.5)
-      .setDepth(1);
+    const icon = this.add.graphics();
+    this.drawPickupIcon(icon, kind);
+    icon.setDepth(1);
     return this.add.container(0, 0, [outerGlow, core, icon]).setDepth(30);
+  }
+
+  /** Vector icons inside the pickup core. All drawn at radius ~7 around (0,0) so they sit inside the 11px core. */
+  private drawPickupIcon(g: Phaser.GameObjects.Graphics, kind: PickupState["kind"]): void {
+    g.clear();
+    g.lineStyle(1.8, 0x0f1432, 1);
+    g.fillStyle(0x0f1432, 1);
+    if (kind === "speed") {
+      // Lightning bolt: simple zig.
+      g.fillTriangle(-2, -7, 4, -1, -1, -1);
+      g.fillTriangle(1, 1, 4, 7, -3, 1);
+    } else if (kind === "ammo") {
+      // Bullet/cartridge: rounded rect with tip.
+      g.fillRoundedRect(-4, -5, 8, 7, 1.5);
+      g.fillTriangle(-4, -5, 4, -5, 0, -8);
+    } else if (kind === "shield") {
+      // Shield outline with center cross.
+      g.beginPath();
+      g.moveTo(0, -7);
+      g.lineTo(6, -4);
+      g.lineTo(6, 2);
+      g.lineTo(0, 7);
+      g.lineTo(-6, 2);
+      g.lineTo(-6, -4);
+      g.closePath();
+      g.strokePath();
+      g.lineBetween(0, -3, 0, 4);
+      g.lineBetween(-3, 0, 3, 0);
+    } else if (kind === "magnet") {
+      // Horseshoe magnet: U-shape with stubby ends.
+      g.lineStyle(2.2, 0x0f1432, 1);
+      g.beginPath();
+      g.arc(0, 1, 5.5, Math.PI, 0, true);
+      g.strokePath();
+      g.lineBetween(-5.5, 1, -5.5, 6);
+      g.lineBetween(5.5, 1, 5.5, 6);
+    } else if (kind === "repel") {
+      // Outward-radiating arrows: four short arrows from center.
+      g.lineStyle(1.8, 0x0f1432, 1);
+      const arrow = (dx: number, dy: number) => {
+        g.lineBetween(0, 0, dx, dy);
+        const perpX = -dy * 0.35;
+        const perpY = dx * 0.35;
+        g.lineBetween(dx, dy, dx - dx * 0.35 + perpX, dy - dy * 0.35 + perpY);
+        g.lineBetween(dx, dy, dx - dx * 0.35 - perpX, dy - dy * 0.35 - perpY);
+      };
+      arrow(0, -6);
+      arrow(0, 6);
+      arrow(-6, 0);
+      arrow(6, 0);
+    } else {
+      g.fillCircle(0, 0, 3);
+    }
   }
 
   private updateCountdownText(state: ArenaState): void {

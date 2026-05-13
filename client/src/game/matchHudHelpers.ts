@@ -2,16 +2,18 @@ import {
   ARENA_HEIGHT,
   ARENA_WIDTH,
   FFA_CORNER_BASE_ZONE_RADIUS,
+  FFA_TEAM_IDS,
   PLAYER_RADIUS,
   SAFE_ZONE_SIZE,
   ffaTeamHomeCenter,
-  octagonSandboxTeamHome,
   type ArenaState,
   type PlayerState,
 } from "@shared";
 
 const NEUTRAL_FLAG_ID = "flag-neutral";
-const OCTAGON_FFA_SANDBOX_TEAMS = ["red", "blue", "green", "yellow"] as const;
+const RACE_SPAWN_BAND_MAX_X = ARENA_WIDTH * 0.12;
+const RACE_FLAG_HOME_X = ARENA_WIDTH * 0.92;
+const RACE_FLAG_HOME_Y = ARENA_HEIGHT * 0.5;
 
 function isFfaMode(state: ArenaState): boolean {
   return state.gameMode === "ffa";
@@ -22,11 +24,18 @@ function teamHomeCenter(team: string, gameMode?: string): { x: number; y: number
     const o = ffaTeamHomeCenter(team);
     if (o) return o;
   }
+  if (gameMode === "race") {
+    return { x: (PLAYER_RADIUS + RACE_SPAWN_BAND_MAX_X) * 0.5, y: ARENA_HEIGHT * 0.5 };
+  }
   const baseMinX = PLAYER_RADIUS;
   const baseMinY = PLAYER_RADIUS;
   const baseMaxX = ARENA_WIDTH - PLAYER_RADIUS;
   const baseMaxY = ARENA_HEIGHT - PLAYER_RADIUS;
   const half = SAFE_ZONE_SIZE * 0.5;
+  if (gameMode === "team_ctf") {
+    if (team === "blue") return { x: baseMaxX - half, y: baseMaxY - half };
+    return { x: baseMinX + half, y: baseMinY + half };
+  }
   if (team === "blue") return { x: baseMaxX - half, y: baseMinY + half };
   if (team === "green") return { x: baseMinX + half, y: baseMaxY - half };
   if (team === "yellow") return { x: baseMaxX - half, y: baseMaxY - half };
@@ -39,6 +48,9 @@ export function getObjectiveWorldTarget(state: ArenaState, local: PlayerState): 
   const home = teamHomeCenter(local.team, state.gameMode);
 
   if (neutral?.carrierId === local.id) {
+    if (state.gameMode === "race") {
+      return { x: home.x, y: home.y, hint: "Bring the flag back to the spawn band to win" };
+    }
     return {
       x: home.x,
       y: home.y,
@@ -62,7 +74,7 @@ export function getObjectiveWorldTarget(state: ArenaState, local: PlayerState): 
     return {
       x: neutral.x,
       y: neutral.y,
-      hint: "Pick up the neutral flag at center",
+      hint: state.gameMode === "race" ? "Race to the flag on the far side" : "Pick up the neutral flag at center",
     };
   }
 
@@ -81,7 +93,7 @@ export function isInEnemySafeZone(
   state?: Pick<ArenaState, "gameMode">,
 ): boolean {
   if (state?.gameMode === "ffa") {
-    for (const tid of OCTAGON_FFA_SANDBOX_TEAMS) {
+    for (const tid of FFA_TEAM_IDS) {
       if (tid === myTeam) continue;
       const c = ffaTeamHomeCenter(tid);
       if (!c) continue;
@@ -89,16 +101,25 @@ export function isInEnemySafeZone(
     }
     return false;
   }
+  // Race mode has a shared spawn band, no enemy safe zones to flag.
+  if (state?.gameMode === "race") return false;
   const baseMinX = PLAYER_RADIUS;
   const baseMinY = PLAYER_RADIUS;
   const baseMaxX = ARENA_WIDTH - PLAYER_RADIUS;
   const baseMaxY = ARENA_HEIGHT - PLAYER_RADIUS;
-  const zones: Array<{ team: string; minX: number; minY: number; maxX: number; maxY: number }> = [
+  const allZones: Array<{ team: string; minX: number; minY: number; maxX: number; maxY: number }> = [
     { team: "red", minX: baseMinX, minY: baseMinY, maxX: baseMinX + SAFE_ZONE_SIZE, maxY: baseMinY + SAFE_ZONE_SIZE },
     { team: "blue", minX: baseMaxX - SAFE_ZONE_SIZE, minY: baseMinY, maxX: baseMaxX, maxY: baseMinY + SAFE_ZONE_SIZE },
     { team: "green", minX: baseMinX, minY: baseMaxY - SAFE_ZONE_SIZE, maxX: baseMinX + SAFE_ZONE_SIZE, maxY: baseMaxY },
     { team: "yellow", minX: baseMaxX - SAFE_ZONE_SIZE, minY: baseMaxY - SAFE_ZONE_SIZE, maxX: baseMaxX, maxY: baseMaxY },
   ];
+  // Team CTF places blue at bottom-right (matches server initializeTeamCtfFlags layout).
+  const zones = state?.gameMode === "team_ctf"
+    ? [
+        { team: "red", minX: baseMinX, minY: baseMinY, maxX: baseMinX + SAFE_ZONE_SIZE, maxY: baseMinY + SAFE_ZONE_SIZE },
+        { team: "blue", minX: baseMaxX - SAFE_ZONE_SIZE, minY: baseMaxY - SAFE_ZONE_SIZE, maxX: baseMaxX, maxY: baseMaxY },
+      ]
+    : allZones;
   return zones.some(
     (z) =>
       z.team !== myTeam &&

@@ -11,8 +11,9 @@ export function mountHomePage(root: HTMLElement): Promise<HomeLaunchPayload> {
       <label class="hub__label">Name</label>
       <input id="hub-name" class="hub__input" maxlength="18" placeholder="unnamed" autocomplete="off" />
       <div class="hub__modes">
-        <button type="button" class="hub__mode hub__mode--active" data-mode="ffa">FFA</button>
-        <button type="button" class="hub__mode" data-mode="sandbox">Sandbox</button>
+        <button type="button" class="hub__mode hub__mode--active" data-mode="ffa">Solo FFA</button>
+        <button type="button" class="hub__mode" data-mode="team_ctf">Team CTF</button>
+        <button type="button" class="hub__mode" data-mode="race">Race</button>
       </div>
       <button type="button" id="hub-play" class="hub__play">Play</button>
     </div>
