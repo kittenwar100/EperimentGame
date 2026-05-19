@@ -7,12 +7,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 All commands run from the repo root and use npm workspaces.
 
 - `npm install` — installs all three workspaces.
-- `npm run dev` — runs server (`tsx watch` on `:2567`) and client (Vite on `:5173`) in parallel via `concurrently`.
+- `npm run dev` — client only (Vite on `:5173`); multiplayer uses `VITE_SERVER_URL` from `client/.env` (Railway by default).
+- `npm run dev:local` — runs local server (`tsx watch` on `:2567`) and client together (set `VITE_SERVER_URL=ws://localhost:2567` in `client/.env` or remove it).
 - `npm run build` — builds `shared`, then `server` (tsc), then `client` (vite build), in that order.
 - `npm test` — runs the server test suite only (`node --test --import tsx server/src/**/*.test.ts`). There are no client tests.
 - Run a single server test file: `npm test --workspace @core-surge/server -- server/src/simulation.test.ts` (or `node --test --import tsx server/src/simulation.test.ts` from `server/`).
 - Server health probe (when running): `GET http://localhost:2567/health`.
-- Client dev override: set `VITE_SERVER_URL=ws://host:port` to point the Colyseus client at a non-default server (otherwise it derives `ws[s]://<window.location.hostname>:2567`).
+- Client server URL: set `VITE_SERVER_URL` in `client/.env` (e.g. `wss://your-app.up.railway.app`). Required for dev and production builds; if unset, the client falls back to `ws[s]://<window.location.hostname>:2567`.
 
 ## Architecture
 

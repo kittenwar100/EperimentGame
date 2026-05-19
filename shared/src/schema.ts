@@ -20,7 +20,7 @@ export const PlayerState = schema({
   respawnMs: "number",
   /** Ms remaining of the 10s 75% slow from a spike hit. */
   spikeSlowMs: "number",
-  /** Set on first spike hit this round; capped at 25% permanent slow. Cleared on round restart. */
+  /** Legacy field; no longer written by the server. Cleared on round restart. */
   spikePermSlow: "boolean",
   /** Boost charges remaining this life. Refilled to BOOST_CHARGES_PER_LIFE on respawn. */
   boostCharges: "number",
@@ -64,6 +64,8 @@ export const FlagState = schema({
   carrierId: "string",
   atBase: "boolean",
   carryAgeMs: "number",
+  /** Ms remaining where bump/projectile steals from this carrier are blocked. */
+  stealProtectionMs: "number",
 }, "FlagState");
 export type FlagState = InstanceType<typeof FlagState>;
 

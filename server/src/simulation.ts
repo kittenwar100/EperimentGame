@@ -5,19 +5,22 @@ import {
   BOOST_COOLDOWN_MS,
   BOOST_DURATION_MS,
   BOOST_SPEED_MULTIPLIER,
-  CAPTURE_DURATION_MS,
   CAPTURE_RADIUS,
   EMPTY_INPUT,
   EXTRA_BULLET_CHARGES,
   ENDGAME_LAST_MS,
+  FLAG_STEAL_PROTECTION_MS,
   FFA_FRENZY_AFTER_MS,
   FFA_MATCH_DURATION_MS,
   FFA_TEAM_IDS,
   MATCH_DURATION_MS,
   MAX_BOTS,
+  NORMAL_MOVE_SPEED_MULTIPLIER,
   PICKUP_RESPAWN_MS,
   PICKUP_RADIUS,
+  BULLET_RECHARGE_MS,
   PLAYER_BASE_ACCEL,
+  PLAYER_MAX_BULLET_CHARGES,
   PLAYER_DRAG,
   PLAYER_MAX_SPEED,
   PLAYER_RADIUS,
@@ -29,6 +32,17 @@ import {
   PROJECTILE_RADIUS,
   PROJECTILE_SPEED,
   PUSH_COOLDOWN_MS,
+  RACE_FLAG_HOME_X,
+  RACE_FLAG_HOME_Y,
+  RACE_SPAWN_BAND_MAX_X,
+  RACE_SPAWN_BAND_MIN_X,
+  RACE_HOME_BASE_X,
+  RACE_HOME_BASE_Y,
+  RACE_BASE_GRID_STEP_X,
+  RACE_BASE_GRID_STEP_Y,
+  RACE_SPAWN_IN_BAND_PAD_X,
+  RACE_SPAWN_IN_BAND_Y_MAX_FRAC,
+  RACE_SPAWN_IN_BAND_Y_MIN_FRAC,
   ROUND_COUNTDOWN_MS,
   ROUND_RESULTS_MS,
   SAFE_ZONE_SIZE,
@@ -37,7 +51,6 @@ import {
   SPIKE_RADIUS,
   SPIKE_SLOW_DURATION_MS,
   SPIKE_SLOW_MULTIPLIER,
-  SPIKE_PERM_SLOW_MULTIPLIER,
   SPEED_POWERUP_DURATION_MS,
   WORLD_EVENT_DURATION_MS,
   WORLD_EVENT_INTERVAL_MS,
@@ -47,6 +60,7 @@ import {
   FFA_CORNER_BASE_ZONE_RADIUS,
   clampToOctagon,
   ffaBaseCenters,
+  getTeamCtfBaseRects,
   pointInOctagon,
   octagonVertices,
   type GameModeId,
@@ -101,7 +115,6 @@ const HUMAN_FLAG_STEAL_SPEED_MS = 2400;
 const HUMAN_FLAG_STEAL_SCORE = 12;
 const HUMAN_FLAG_STEAL_BOOST_MS = 700;
 const HUMAN_DIRECT_HIT_EXTRA_SCORE = 6;
-const HUMAN_CAPTURE_ROUND_BONUS_SCORE = 18;
 const HUMAN_FLAG_SCORE_BONUS = 15;
 const TEAM_RED: Team = "red";
 const TEAM_BLUE: Team = "blue";
@@ -130,9 +143,12 @@ const BOT_SUPPORT_RADIUS = 2813;
 const BOT_PREDICTIVE_AIM_SECONDS = -0.14;
 /** Random yaw added to bot shot direction each tick (radians); ~±28° max. */
 const BOT_AIM_MAX_ANGLE_ERROR_RAD = 0.5;
+/** Minimum gap between bot shots (in addition to {@link PUSH_COOLDOWN_MS}). */
+const BOT_FIRE_COOLDOWN_MS = 1150;
+const BOT_FIRE_COOLDOWN_JITTER_MS = 400;
+/** Extra threat score so humans carrying a flag draw bot fire and chase. */
+const BOT_HUMAN_FLAG_CARRIER_BONUS = 1100;
 const BOT_SPEED_MULTIPLIER = 0.75;
-const BASE_AMMO_RECHARGE_MS = 2100;
-const TRAILING_AMMO_RECHARGE_MS = 1300;
 const MAP_LAYOUT_COUNT = 3;
 type BotRole = "attacker" | "defender" | "interceptor";
 type SafeZone = { team: Team; minX: number; minY: number; maxX: number; maxY: number };
@@ -149,10 +165,6 @@ const OCTAGON_FFA_BASE_SLOTS: readonly { team: string; vertexIndex: number }[] =
   { team: "ffa7", vertexIndex: 7 },
 ];
 /** Race mode rectangle layout: all players spawn in a left-side band; the flag sits on the right edge. */
-const RACE_SPAWN_BAND_MIN_X = PLAYER_RADIUS;
-const RACE_SPAWN_BAND_MAX_X = ARENA_WIDTH * 0.12;
-const RACE_FLAG_HOME_X = ARENA_WIDTH * 0.92;
-const RACE_FLAG_HOME_Y = ARENA_HEIGHT * 0.5;
 const FFA_SCORE_KEYS = [
   "ffa0Score",
   "ffa1Score",
@@ -195,6 +207,7 @@ export class GameSimulation {
   private botEdgeSpawnCursor = 0;
   private mapLayoutIndex = 0;
   private readonly ammoRechargeAtMs = new Map<string, number>();
+  private readonly botNextFireAtMs = new Map<string, number>();
   private readonly captureAssistIds = new Set<string>();
   private readonly wasInOwnSafeZone = new Map<string, boolean>();
   private nextWorldEventAtElapsedMs = WORLD_EVENT_INTERVAL_MS;
@@ -359,22 +372,23 @@ export class GameSimulation {
     player.isBot = isBot;
     player.team = this.pickBalancedTeam();
     player.alive = true;
-    const spawn = isBot
-      ? this.pickUniqueBotEdgeSpawnPoint()
-      : this.isSoloMode() || this.isTeamCtf()
-        ? this.pickTeamBaseSpawnPoint(player)
-        : this.pickSpawnPoint(undefined, false);
+    const spawn =
+      isBot && !this.isRace()
+        ? this.pickUniqueBotEdgeSpawnPoint()
+        : this.isSoloMode() || this.isTeamCtf()
+          ? this.pickTeamBaseSpawnPoint(player)
+          : this.pickSpawnPoint(undefined, false);
     player.x = spawn.x;
     player.y = spawn.y;
     player.vx = 0;
     player.vy = 0;
-    player.rotation = randomRange(-Math.PI, Math.PI);
+    player.rotation = this.isRace() ? 0 : randomRange(-Math.PI, Math.PI);
     player.hp = 100;
     player.boostMs = 0;
     player.speedBoostMs = 0;
     player.stunnedMs = 0;
     player.pushCooldownMs = 0;
-    player.bulletCharges = 1;
+    player.bulletCharges = PLAYER_MAX_BULLET_CHARGES;
     player.respawnMs = 0;
     player.vehicleClass = "interceptor";
     player.score = 0;
@@ -400,6 +414,7 @@ export class GameSimulation {
     this.state.players.delete(id);
     this.inputs.delete(id);
     this.ammoRechargeAtMs.delete(id);
+    this.botNextFireAtMs.delete(id);
     this.wasInOwnSafeZone.delete(id);
   }
 
@@ -449,6 +464,8 @@ export class GameSimulation {
     this.updatePlayers(deltaMs);
     this.updateSpikes(deltaMs);
     this.resolvePlayerCollisions();
+    this.updateAllFlagStealProtection(deltaMs);
+    this.updateFlags();
     this.updateNeutralFlag(deltaMs);
     this.updateProjectiles(deltaMs);
     this.updatePickups(deltaMs);
@@ -621,14 +638,13 @@ export class GameSimulation {
           ? FIRST_ROUND_HUMAN_MOVE_MULTIPLIER
           : 1;
       const spikeSlowFactor = player.spikeSlowMs > 0 ? SPIKE_SLOW_MULTIPLIER : 1;
-      const spikePermFactor = player.spikePermSlow ? SPIKE_PERM_SLOW_MULTIPLIER : 1;
       const speedFactor =
         PLAYER_SPEED_MULTIPLIER *
+        NORMAL_MOVE_SPEED_MULTIPLIER *
         midfieldBoost *
         powerupBoost *
         (player.boostMs > 0 ? BOOST_SPEED_MULTIPLIER : 1) *
         spikeSlowFactor *
-        spikePermFactor *
         gravitySpeedBonus *
         firstRoundHumanBoost;
       const carriesNeutralFlag = this.getNeutralFlag()?.carrierId === player.id;
@@ -685,6 +701,13 @@ export class GameSimulation {
         this.spawnProjectile(player, input);
         player.pushCooldownMs = shotSpacingMs;
         player.bulletCharges = Math.max(0, player.bulletCharges - 1);
+        this.scheduleAmmoRecharge(player);
+        if (player.isBot) {
+          this.botNextFireAtMs.set(
+            player.id,
+            this.elapsedMs + BOT_FIRE_COOLDOWN_MS + randomRange(0, BOT_FIRE_COOLDOWN_JITTER_MS),
+          );
+        }
       }
       this.tryRechargeAmmo(player);
 
@@ -777,14 +800,12 @@ export class GameSimulation {
         }
         this.state.spikes.delete(hitSpikeId);
         this.state.projectiles.delete(id);
-        this.restoreBulletCharge(projectile.ownerId);
         continue;
       }
 
       if (hitPlayer || outOfBounds) {
         this.explodeProjectile(projectile, hitPlayer?.id);
         this.state.projectiles.delete(id);
-        this.restoreBulletCharge(projectile.ownerId);
       }
     }
   }
@@ -828,6 +849,8 @@ export class GameSimulation {
         b.x = pb.x;
         b.y = pb.y;
 
+        this.tryStealFlagsOnPlayerBump(a, b, speedA, speedB);
+
         // One-way momentum transfer: attacker barely recoils, target flies back.
         const relAlongNormal = (a.vx - b.vx) * nx + (a.vy - b.vy) * ny;
         if (relAlongNormal > 0) {
@@ -847,81 +870,12 @@ export class GameSimulation {
     }
   }
 
-  private updateCaptureCircle(deltaMs: number): void {
-    const teamsInside = new Map<string, number>();
-    for (const player of this.state.players.values()) {
-      if (!player.alive) continue;
-      if (Math.hypot(player.x - this.state.captureX, player.y - this.state.captureY) <= this.state.captureRadius) {
-        teamsInside.set(player.team, (teamsInside.get(player.team) ?? 0) + 1);
-      }
-    }
-
-    if (teamsInside.size === 0) {
-      this.state.captureTeam = "";
-      this.captureAssistIds.clear();
-      this.state.captureProgress = Math.max(0, this.state.captureProgress - deltaMs / (CAPTURE_DURATION_MS * 1.7));
-      return;
-    }
-
-    let leadingTeam = "";
-    let leadingCount = -1;
-    let secondCount = -1;
-    for (const [team, count] of teamsInside.entries()) {
-      if (count > leadingCount) {
-        secondCount = leadingCount;
-        leadingCount = count;
-        leadingTeam = team;
-      } else if (count > secondCount) {
-        secondCount = count;
-      }
-    }
-
-    if (leadingCount <= 0 || leadingCount === secondCount) {
-      this.captureAssistIds.clear();
-      this.state.captureProgress = Math.max(0, this.state.captureProgress - deltaMs / (CAPTURE_DURATION_MS * 2.5));
-      return;
-    }
-
-    if (this.state.captureTeam !== leadingTeam) {
-      this.captureAssistIds.clear();
-      this.state.captureTeam = leadingTeam;
-      this.state.captureProgress = Math.max(0, this.state.captureProgress - deltaMs * 0.08);
-    }
-    for (const player of this.state.players.values()) {
-      if (!player.alive || player.team !== leadingTeam) continue;
-      if (Math.hypot(player.x - this.state.captureX, player.y - this.state.captureY) <= this.state.captureRadius) {
-        this.captureAssistIds.add(player.id);
-      }
-    }
-    const majorityBonus = 1 + (leadingCount - Math.max(0, secondCount)) * 0.5;
-    const capSpeed = this.hasMutator("hasty_caps") ? 1.35 : 1;
-    this.state.captureProgress = clamp(
-      this.state.captureProgress + (deltaMs / CAPTURE_DURATION_MS) * majorityBonus * capSpeed,
-      0,
-      1,
-    );
-    if (this.state.captureProgress >= 1) {
-      this.awardRound(leadingTeam);
-    }
-  }
-
-  private awardRound(team: string): void {
-    const combo = this.captureAssistIds.size >= 2;
-    const bonus = combo ? 1 : 0;
-    if (team === TEAM_RED) this.state.redScore += 1 + bonus;
-    if (team === TEAM_BLUE) this.state.blueScore += 1 + bonus;
-    if (team === TEAM_GREEN) this.state.greenScore += 1 + bonus;
-    if (team === TEAM_YELLOW) this.state.yellowScore += 1 + bonus;
-    for (const id of this.captureAssistIds) {
-      const participant = this.state.players.get(id);
-      if (!participant?.alive || participant.team !== team) continue;
-      participant.wins += 1;
-      if (!participant.isBot) {
-        participant.score += HUMAN_CAPTURE_ROUND_BONUS_SCORE;
-      }
-    }
+  private updateCaptureCircle(_deltaMs: number): void {
+    // The center ring is now a visual/objective landmark only. Flags must be
+    // physically picked up and scored at a base; waiting in the circle cannot win.
+    this.state.captureTeam = "";
     this.captureAssistIds.clear();
-    this.startNextRound();
+    this.state.captureProgress = 0;
   }
 
   private updatePickups(_deltaMs: number): void {
@@ -935,6 +889,14 @@ export class GameSimulation {
     }
   }
 
+  private updateAllFlagStealProtection(deltaMs: number): void {
+    for (const flag of this.state.flags.values()) {
+      if (flag.stealProtectionMs > 0) {
+        flag.stealProtectionMs = Math.max(0, flag.stealProtectionMs - deltaMs);
+      }
+    }
+  }
+
   private updateFlags(): void {
     for (const flag of this.state.flags.values()) {
       if (!flag.carrierId) continue;
@@ -942,6 +904,7 @@ export class GameSimulation {
       if (!carrier || !carrier.alive) {
         flag.carrierId = "";
         flag.atBase = false;
+        flag.stealProtectionMs = 0;
         continue;
       }
       flag.x = carrier.x;
@@ -1027,15 +990,20 @@ export class GameSimulation {
     const pickupTarget = needsAmmo ? this.findNearestActivePickup(player.x, player.y, "ammo") : this.findNearestActivePickup(player.x, player.y);
     const neutralFlag = this.getNeutralFlag();
     const carryingNeutralFlag = neutralFlag?.carrierId === player.id;
-    const teammateCarrier = this.findNearestTeammateNeutralFlagCarrier(player, BOT_SUPPORT_RADIUS);
+    const enemyCarrierTarget = this.findEnemyFlagCarrierForTeam(player.team);
+    const teammateCarrier = this.shouldEscortTeammateCarrier(player)
+      ? this.findNearestTeammateNeutralFlagCarrier(player, BOT_SUPPORT_RADIUS)
+      : undefined;
     const teamHomeTarget = this.getTeamSafeZoneCenter(player.team);
     const neutralFlagTarget = neutralFlag && !neutralFlag.carrierId ? { x: neutralFlag.x, y: neutralFlag.y } : undefined;
-    const enemyCarrierTarget = this.findEnemyFlagCarrierForTeam(player.team);
+    const enemyCarrierPoint = enemyCarrierTarget
+      ? { x: enemyCarrierTarget.x, y: enemyCarrierTarget.y }
+      : undefined;
 
     const target = carryingNeutralFlag
       ? teamHomeTarget
-      : teammateCarrier ??
-        enemyCarrierTarget ??
+      : enemyCarrierPoint ??
+        teammateCarrier ??
         neutralFlagTarget ??
         threateningEnemy ??
         enemy ??
@@ -1052,7 +1020,11 @@ export class GameSimulation {
 
     if (enemy) {
       const enemyDistance = Math.hypot(enemy.x - player.x, enemy.y - player.y);
-      if (enemyDistance < BOT_COMBAT_STANDOFF_DISTANCE && !carryingNeutralFlag) {
+      const enemyIsFlagCarrier = this.isEnemyFlagCarrier(player, enemy);
+      if (enemyIsFlagCarrier) {
+        const intercept = normalizeVector(enemy.x - player.x, enemy.y - player.y);
+        direction = normalizeVector(intercept.x * 0.82 + strafe.x * 0.18, intercept.y * 0.82 + strafe.y * 0.18);
+      } else if (enemyDistance < BOT_COMBAT_STANDOFF_DISTANCE && !carryingNeutralFlag) {
         const retreat = normalizeVector(player.x - enemy.x, player.y - enemy.y);
         direction = normalizeVector(retreat.x * 0.68 + strafe.x * 0.32, retreat.y * 0.68 + strafe.y * 0.32);
       }
@@ -1077,8 +1049,15 @@ export class GameSimulation {
         )
       : direction;
     const distanceToTarget = Math.hypot(toTargetX, toTargetY);
+    const botMayFire = this.elapsedMs >= (this.botNextFireAtMs.get(player.id) ?? 0);
+    const chaseHumanCarrier = Boolean(enemyCarrierTarget && !enemyCarrierTarget.isBot);
     const fire = Boolean(
-      aimTarget && player.pushCooldownMs <= 0 && this.canFireProjectile(player) && this.hasLinePressureTarget(player, aimTarget),
+      aimTarget &&
+        player.pushCooldownMs <= 0 &&
+        this.canFireProjectile(player) &&
+        this.hasLinePressureTarget(player, aimTarget) &&
+        botMayFire &&
+        (!chaseHumanCarrier || this.hasLinePressureTarget(player, enemyCarrierTarget!)),
     );
     const boost = distanceToTarget > 620 && !spike;
     return { moveX: direction.x, moveY: direction.y, aimX: aim.x, aimY: aim.y, boost, fire };
@@ -1146,7 +1125,7 @@ export class GameSimulation {
       player.speedBoostMs = 0;
       player.stunnedMs = 0;
       player.pushCooldownMs = 0;
-      player.bulletCharges = 1;
+      player.bulletCharges = PLAYER_MAX_BULLET_CHARGES;
       player.respawnMs = 0;
       player.streak = 0;
       player.zoneTicks = 0;
@@ -1174,26 +1153,29 @@ export class GameSimulation {
   }
 
   private initializeTeamCtfFlags(): void {
+    const ctf = getTeamCtfBaseRects();
     const redFlag = new FlagState();
     redFlag.id = "flag-red";
     redFlag.team = TEAM_RED;
-    redFlag.homeX = ARENA_WIDTH * 0.08;
-    redFlag.homeY = ARENA_HEIGHT * 0.5;
+    redFlag.homeX = (ctf.red.minX + ctf.red.maxX) * 0.5;
+    redFlag.homeY = (ctf.red.minY + ctf.red.maxY) * 0.5;
     redFlag.x = redFlag.homeX;
     redFlag.y = redFlag.homeY;
     redFlag.carrierId = "";
     redFlag.atBase = true;
+    redFlag.stealProtectionMs = 0;
     this.state.flags.set(redFlag.id, redFlag);
 
     const blueFlag = new FlagState();
     blueFlag.id = "flag-blue";
     blueFlag.team = TEAM_BLUE;
-    blueFlag.homeX = ARENA_WIDTH * 0.92;
-    blueFlag.homeY = ARENA_HEIGHT * 0.5;
+    blueFlag.homeX = (ctf.blue.minX + ctf.blue.maxX) * 0.5;
+    blueFlag.homeY = (ctf.blue.minY + ctf.blue.maxY) * 0.5;
     blueFlag.x = blueFlag.homeX;
     blueFlag.y = blueFlag.homeY;
     blueFlag.carrierId = "";
     blueFlag.atBase = true;
+    blueFlag.stealProtectionMs = 0;
     this.state.flags.set(blueFlag.id, blueFlag);
   }
 
@@ -1207,6 +1189,7 @@ export class GameSimulation {
     flag.y = flag.homeY;
     flag.carrierId = "";
     flag.atBase = true;
+    flag.stealProtectionMs = 0;
     flag.carryAgeMs = 0;
     this.state.flags.set(flag.id, flag);
   }
@@ -1226,6 +1209,7 @@ export class GameSimulation {
     redFlag.y = redFlag.homeY;
     redFlag.carrierId = "";
     redFlag.atBase = true;
+    redFlag.stealProtectionMs = 0;
     this.state.flags.set(redFlag.id, redFlag);
 
     const blueFlag = new FlagState();
@@ -1237,6 +1221,7 @@ export class GameSimulation {
     blueFlag.y = blueFlag.homeY;
     blueFlag.carrierId = "";
     blueFlag.atBase = true;
+    blueFlag.stealProtectionMs = 0;
     this.state.flags.set(blueFlag.id, blueFlag);
   }
 
@@ -1250,6 +1235,7 @@ export class GameSimulation {
     flag.y = flag.homeY;
     flag.carrierId = "";
     flag.atBase = true;
+    flag.stealProtectionMs = 0;
     flag.carryAgeMs = 0;
     this.state.flags.set(flag.id, flag);
   }
@@ -1377,8 +1363,12 @@ export class GameSimulation {
         player.score += 3;
       }
       if (pickup.kind === "ammo") {
-        const maxCharges = player.isBot ? 1 : 3;
-        player.bulletCharges = Math.min(maxCharges, player.bulletCharges + EXTRA_BULLET_CHARGES);
+        player.bulletCharges = Math.min(PLAYER_MAX_BULLET_CHARGES, player.bulletCharges + EXTRA_BULLET_CHARGES);
+        if (player.bulletCharges >= PLAYER_MAX_BULLET_CHARGES) {
+          this.ammoRechargeAtMs.delete(player.id);
+        } else {
+          this.scheduleAmmoRecharge(player);
+        }
         player.score += 3;
       }
       if (pickup.kind === "shield") {
@@ -1397,18 +1387,15 @@ export class GameSimulation {
   }
 
   private tryHitSpike(player: PlayerState): void {
-    for (const spike of this.state.spikes.values()) {
+    for (const [id, spike] of this.state.spikes.entries()) {
       const hitRadius = PLAYER_RADIUS + spike.radius;
       if (Math.hypot(player.x - spike.x, player.y - spike.y) > hitRadius) continue;
-      if (spike.spikeKind === "pull") {
-        const dx = spike.x - player.x;
-        const dy = spike.y - player.y;
-        const len = Math.hypot(dx, dy) || 1;
-        player.vx += (dx / len) * 640;
-        player.vy += (dy / len) * 640;
-      }
+
+      // Player contact consumes the obstacle. It leaves the slow debuff / field,
+      // but no longer acts like a wall, stun, or pull trap that stops movement.
+      this.spawnSlowZoneAt(spike.x, spike.y);
+      this.state.spikes.delete(id);
       player.spikeSlowMs = SPIKE_SLOW_DURATION_MS;
-      player.spikePermSlow = true;
       return;
     }
   }
@@ -1434,6 +1421,7 @@ export class GameSimulation {
       if (flag.carrierId === player.id) {
         flag.carrierId = "";
         flag.atBase = false;
+        flag.stealProtectionMs = 0;
         flag.x = player.x;
         flag.y = player.y;
       }
@@ -1470,10 +1458,11 @@ export class GameSimulation {
     player.vy = 0;
     player.stunnedMs = 0;
     player.spikeSlowMs = 0;
+    player.spikePermSlow = false;
     player.boostCharges = BOOST_CHARGES_PER_LIFE;
     player.boostCooldownMs = 0;
     player.boostMs = 0;
-    player.rotation = randomRange(-Math.PI, Math.PI);
+    player.rotation = this.isRace() ? 0 : randomRange(-Math.PI, Math.PI);
   }
 
   private pickTeamBaseSpawnPoint(player: PlayerState): { x: number; y: number } {
@@ -1484,10 +1473,36 @@ export class GameSimulation {
       }
     }
     if (this.isRace()) {
-      return {
-        x: randomRange(RACE_SPAWN_BAND_MIN_X + 60, RACE_SPAWN_BAND_MAX_X - 40),
-        y: randomRange(ARENA_HEIGHT * 0.1, ARENA_HEIGHT * 0.9),
-      };
+      const minX = RACE_SPAWN_BAND_MIN_X + RACE_SPAWN_IN_BAND_PAD_X;
+      const maxX = RACE_SPAWN_BAND_MAX_X - PLAYER_RADIUS * 3;
+      const minY = ARENA_HEIGHT * RACE_SPAWN_IN_BAND_Y_MIN_FRAC;
+      const maxY = ARENA_HEIGHT * RACE_SPAWN_IN_BAND_Y_MAX_FRAC;
+      const slotIdx = Math.max(0, FFA_TEAM_IDS.indexOf(player.team as (typeof FFA_TEAM_IDS)[number]));
+      const col = slotIdx % 2;
+      const row = Math.floor(slotIdx / 2);
+      let x = RACE_HOME_BASE_X + (col - 0.5) * RACE_BASE_GRID_STEP_X;
+      let y = RACE_HOME_BASE_Y + (row - 1.5) * RACE_BASE_GRID_STEP_Y;
+      x = clamp(x, minX, maxX);
+      y = clamp(y, minY, maxY);
+      return { x, y };
+    }
+    if (this.isTeamCtf()) {
+      const ctf = getTeamCtfBaseRects();
+      const rect = this.asTeam(player.team) === TEAM_BLUE ? ctf.blue : ctf.red;
+      const pad = Math.max(PLAYER_RADIUS * 4, 52);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        const p = {
+          x: randomRange(rect.minX + pad, rect.maxX - pad),
+          y: randomRange(rect.minY + pad, rect.maxY - pad),
+        };
+        const tooClose = [...this.state.players.values()].some((other) => {
+          if (!other.alive) return false;
+          if (other.id === player.id) return false;
+          return Math.hypot(p.x - other.x, p.y - other.y) < SPAWN_PLAYER_CLEARANCE;
+        });
+        if (!tooClose) return p;
+      }
+      return { x: (rect.minX + rect.maxX) * 0.5, y: (rect.minY + rect.maxY) * 0.5 };
     }
     const zone = SAFE_ZONES.find((candidate) => candidate.team === this.asTeam(player.team)) ?? SAFE_ZONES[0];
     if (!zone) return this.pickSpawnPoint(player.id, false);
@@ -1579,7 +1594,16 @@ export class GameSimulation {
     // Race mode has a shared spawn band; no per-team safe zones to block.
     if (this.isRace()) return;
     const activeTeams = this.getActiveTeams();
-    for (const zone of SAFE_ZONES) {
+    const zones: SafeZone[] = this.isTeamCtf()
+      ? (() => {
+          const ctf = getTeamCtfBaseRects();
+          return [
+            { team: TEAM_RED, ...ctf.red },
+            { team: TEAM_BLUE, ...ctf.blue },
+          ];
+        })()
+      : [...SAFE_ZONES];
+    for (const zone of zones) {
       if (zone.team === player.team) continue;
       // Team CTF: only the active teams' safe zones are real walls; others are inert.
       if (!activeTeams.includes(zone.team)) continue;
@@ -1685,6 +1709,7 @@ export class GameSimulation {
     if (!flag) return;
     flag.carrierId = "";
     flag.atBase = true;
+    flag.stealProtectionMs = 0;
     flag.carryAgeMs = 0;
     flag.homeX = this.state.captureX;
     flag.homeY = this.state.captureY;
@@ -1699,8 +1724,7 @@ export class GameSimulation {
     const pickupRadius = PLAYER_RADIUS + FLAG_PICKUP_RADIUS;
     const touchesFlag =
       this.distancePointToSegmentSquared(flag.x, flag.y, previousX, previousY, player.x, player.y) <= pickupRadius * pickupRadius;
-    const inCaptureCircle = Math.hypot(player.x - this.state.captureX, player.y - this.state.captureY) <= this.state.captureRadius;
-    if (!touchesFlag && !inCaptureCircle) return;
+    if (!touchesFlag) return;
     flag.carrierId = player.id;
     flag.atBase = false;
     flag.carryAgeMs = 0;
@@ -1758,6 +1782,12 @@ export class GameSimulation {
       const circ = this.getFfaCircles().find((c) => c.team === team);
       return Boolean(circ && Math.hypot(player.x - circ.cx, player.y - circ.cy) < circ.r);
     }
+    if (this.isTeamCtf()) {
+      const teamT = this.asTeam(team);
+      const ctf = getTeamCtfBaseRects();
+      const rect = teamT === TEAM_BLUE ? ctf.blue : ctf.red;
+      return player.x > rect.minX && player.x < rect.maxX && player.y > rect.minY && player.y < rect.maxY;
+    }
     const teamT = this.asTeam(team);
     return SAFE_ZONES.some(
       (zone) =>
@@ -1801,45 +1831,29 @@ export class GameSimulation {
     return player.bulletCharges > 0;
   }
 
-  private restoreBulletCharge(ownerId: string): void {
-    const owner = this.state.players.get(ownerId);
-    if (!owner?.alive) return;
-    if (owner.isBot) return;
-    const maxCharges = owner.isBot ? 1 : 3;
-    owner.bulletCharges = Math.min(maxCharges, owner.bulletCharges + 1);
-  }
-
   private tryRechargeAmmo(player: PlayerState): void {
-    const maxCharges = player.isBot ? 1 : 3;
-    if (this.isFfaFrenzy()) {
-      if (player.bulletCharges < maxCharges) {
-        player.bulletCharges = maxCharges;
-      }
+    if (!player.alive) return;
+    if (player.bulletCharges >= PLAYER_MAX_BULLET_CHARGES) {
       this.ammoRechargeAtMs.delete(player.id);
       return;
     }
-    if (player.bulletCharges >= maxCharges || !player.alive) return;
-    const readyAt = this.ammoRechargeAtMs.get(player.id) ?? this.elapsedMs;
-    if (this.elapsedMs < readyAt) return;
-    player.bulletCharges = Math.min(maxCharges, player.bulletCharges + 1);
-    let rechargeMs = this.isTrailingTeam(player.team) ? TRAILING_AMMO_RECHARGE_MS : BASE_AMMO_RECHARGE_MS;
-    if (this.state.worldEvent === "surge_ammo") {
-      rechargeMs *= 0.5;
+    const readyAt = this.ammoRechargeAtMs.get(player.id);
+    if (readyAt === undefined) {
+      this.scheduleAmmoRecharge(player);
+      return;
     }
-    this.ammoRechargeAtMs.set(player.id, this.elapsedMs + rechargeMs);
+    if (this.elapsedMs < readyAt) return;
+    player.bulletCharges = Math.min(PLAYER_MAX_BULLET_CHARGES, player.bulletCharges + 1);
+    if (player.bulletCharges >= PLAYER_MAX_BULLET_CHARGES) {
+      this.ammoRechargeAtMs.delete(player.id);
+    } else {
+      this.scheduleAmmoRecharge(player);
+    }
   }
 
-  private isTrailingTeam(team: string): boolean {
-    const teamT = this.asTeam(team);
-    const scores = new Map<Team, number>([
-      [TEAM_RED, this.state.redScore],
-      [TEAM_BLUE, this.state.blueScore],
-      [TEAM_GREEN, this.state.greenScore],
-      [TEAM_YELLOW, this.state.yellowScore],
-    ]);
-    const teamScore = scores.get(teamT) ?? 0;
-    const bestScore = Math.max(...scores.values());
-    return teamScore < bestScore;
+  private scheduleAmmoRecharge(player: PlayerState): void {
+    if (player.bulletCharges >= PLAYER_MAX_BULLET_CHARGES || this.ammoRechargeAtMs.has(player.id)) return;
+    this.ammoRechargeAtMs.set(player.id, this.elapsedMs + BULLET_RECHARGE_MS);
   }
 
   private findProjectileHit(projectile: ProjectileState, fromX: number, fromY: number): PlayerState | undefined {
@@ -1912,8 +1926,9 @@ export class GameSimulation {
     }
   }
 
-  /** Direct bullet hit: any flag the victim is carrying moves to the shooter (enemy teams only). */
+  /** Interception: any flag the victim is carrying moves to the attacker (enemy teams only). */
   private stealCarrierFlagsFromVictim(shooter: PlayerState, victim: PlayerState): void {
+    if (!this.canStealFromVictim(victim)) return;
     const hadNeutral = this.getNeutralFlag()?.carrierId === victim.id;
     for (const flag of this.state.flags.values()) {
       if (flag.carrierId !== victim.id) continue;
@@ -1921,12 +1936,30 @@ export class GameSimulation {
       flag.atBase = false;
       flag.x = shooter.x;
       flag.y = shooter.y;
+      flag.stealProtectionMs = FLAG_STEAL_PROTECTION_MS;
     }
     if (hadNeutral && !shooter.isBot) {
       shooter.challengeSteals += 1;
       shooter.speedBoostMs = Math.max(shooter.speedBoostMs, HUMAN_FLAG_STEAL_SPEED_MS);
       shooter.score += HUMAN_FLAG_STEAL_SCORE;
       shooter.boostMs = Math.max(shooter.boostMs, HUMAN_FLAG_STEAL_BOOST_MS);
+    }
+  }
+
+  private tryStealFlagsOnPlayerBump(a: PlayerState, b: PlayerState, speedA: number, speedB: number): void {
+    if (!a.alive || !b.alive || a.team === b.team) return;
+    const aHasFlag = [...this.state.flags.values()].some((flag) => flag.carrierId === a.id);
+    const bHasFlag = [...this.state.flags.values()].some((flag) => flag.carrierId === b.id);
+    if (bHasFlag && !aHasFlag) {
+      this.stealCarrierFlagsFromVictim(a, b);
+    } else if (aHasFlag && !bHasFlag) {
+      this.stealCarrierFlagsFromVictim(b, a);
+    } else if (aHasFlag && bHasFlag) {
+      if (speedA >= speedB) {
+        this.stealCarrierFlagsFromVictim(a, b);
+      } else {
+        this.stealCarrierFlagsFromVictim(b, a);
+      }
     }
   }
 
@@ -2004,7 +2037,10 @@ export class GameSimulation {
       if (toBot > PROJECTILE_MAX_RANGE * 1.7) continue;
       const toBase = Math.hypot(enemy.x - ownBase.x, enemy.y - ownBase.y);
       const carriesNeutralFlag = this.getNeutralFlag()?.carrierId === enemy.id;
-      const pressureScore = (carriesNeutralFlag ? 1500 : 0) + (1400 - Math.min(1400, toBase)) + (1200 - Math.min(1200, toBot));
+      const carriesAnyFlag = this.isCarryingEnemyFlag(enemy) || carriesNeutralFlag;
+      const humanCarrierBonus = carriesAnyFlag && !enemy.isBot ? BOT_HUMAN_FLAG_CARRIER_BONUS : 0;
+      const pressureScore =
+        (carriesNeutralFlag ? 1500 : 0) + humanCarrierBonus + (1400 - Math.min(1400, toBase)) + (1200 - Math.min(1200, toBot));
       if (pressureScore > bestScore) {
         best = enemy;
         bestScore = pressureScore;
@@ -2080,7 +2116,13 @@ export class GameSimulation {
       return { x: FFA_OCTAGON_CENTER_X, y: FFA_OCTAGON_CENTER_Y };
     }
     if (this.isRace()) {
-      return { x: (RACE_SPAWN_BAND_MIN_X + RACE_SPAWN_BAND_MAX_X) * 0.5, y: ARENA_HEIGHT * 0.5 };
+      return { x: RACE_HOME_BASE_X, y: RACE_HOME_BASE_Y };
+    }
+    if (this.isTeamCtf()) {
+      const teamT = this.asTeam(team);
+      const ctf = getTeamCtfBaseRects();
+      const rect = teamT === TEAM_BLUE ? ctf.blue : ctf.red;
+      return { x: (rect.minX + rect.maxX) * 0.5, y: (rect.minY + rect.maxY) * 0.5 };
     }
     const teamT = this.asTeam(team);
     const zone = SAFE_ZONES.find((candidate) => candidate.team === teamT) ?? SAFE_ZONES[0];
@@ -2146,8 +2188,30 @@ export class GameSimulation {
   private resetFlagToBase(flag: FlagState): void {
     flag.carrierId = "";
     flag.atBase = true;
+    flag.stealProtectionMs = 0;
     flag.x = flag.homeX;
     flag.y = flag.homeY;
+  }
+
+  private canStealFromVictim(victim: PlayerState): boolean {
+    for (const flag of this.state.flags.values()) {
+      if (flag.carrierId === victim.id && flag.stealProtectionMs > 0) return false;
+    }
+    return true;
+  }
+
+  private shouldEscortTeammateCarrier(bot: PlayerState): boolean {
+    const flag = this.getNeutralFlag();
+    if (!flag?.carrierId || flag.carrierId === bot.id) return false;
+    const carrier = this.state.players.get(flag.carrierId);
+    if (!carrier?.alive || carrier.team !== bot.team) return false;
+    if (Math.hypot(carrier.x - bot.x, carrier.y - bot.y) > BOT_SUPPORT_RADIUS) return false;
+    for (const other of this.state.players.values()) {
+      if (!other.isBot || !other.alive || other.team !== bot.team || other.id === bot.id) continue;
+      if (Math.hypot(carrier.x - other.x, carrier.y - other.y) > BOT_SUPPORT_RADIUS) continue;
+      if (other.id < bot.id) return false;
+    }
+    return true;
   }
 
   private getFlagByTeam(team: Team): FlagState | undefined {
@@ -2173,5 +2237,11 @@ export class GameSimulation {
       if (flag.team !== player.team && flag.carrierId === player.id) return true;
     }
     return false;
+  }
+
+  private isEnemyFlagCarrier(bot: PlayerState, enemy: PlayerState): boolean {
+    const neutral = this.getNeutralFlag();
+    if (neutral?.carrierId === enemy.id && enemy.team !== bot.team) return true;
+    return this.isCarryingEnemyFlag(enemy) && enemy.team !== bot.team;
   }
 }

@@ -12,15 +12,24 @@
 
 ## Run locally
 
+Copy `client/.env.example` to `client/.env` and set your Railway Colyseus URL:
+
+```env
+VITE_SERVER_URL=wss://your-app.up.railway.app
+```
+
 ```bash
 npm install
 npm run dev
 ```
 
-This starts:
+This starts the client on `http://localhost:5173` and connects to the server in `client/.env` (Railway). It does **not** start a local Colyseus server.
 
-- client on `http://localhost:5173`
-- server on `http://localhost:2567`
+To run a **local** server plus client (for server development):
+
+```bash
+npm run dev:local
+```
 
 ## Build
 

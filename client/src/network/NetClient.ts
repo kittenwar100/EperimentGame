@@ -11,22 +11,87 @@ function getServerUrl(): string {
   return `${protocol}://${window.location.hostname}:2567`;
 }
 
+function readRoomSessionId(room: Room<any, ArenaState>): string {
+  const r = room as unknown as {
+    sessionId?: string;
+    connection?: { sessionId?: string; id?: string };
+  };
+  const direct = r.sessionId;
+  if (typeof direct === "string" && direct.length > 0) return direct.trim();
+  const nested = r.connection?.sessionId;
+  if (typeof nested === "string" && nested.length > 0) return nested.trim();
+  const connId = r.connection?.id;
+  if (typeof connId === "string" && connId.length > 0 && connId.length < 128) return connId.trim();
+  return "";
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timeout = window.setTimeout(() => reject(new Error(`${label} timed out`)), ms);
+    promise.then(
+      (value) => {
+        window.clearTimeout(timeout);
+        resolve(value);
+      },
+      (error: unknown) => {
+        window.clearTimeout(timeout);
+        reject(error);
+      },
+    );
+  });
+}
+
 export class NetClient {
   private readonly client = new Client(getServerUrl());
   room: Room<any, ArenaState> | null = null;
 
+  /** Cached from the Colyseus room once available; used to find `PlayerState` in maps. */
+  private localSessionId = "";
+  /** From the last `join()` options — disambiguates the local human when several are in the room. */
+  private joinDisplayName = "";
+
+  getLocalSessionId(): string {
+    if (!this.room) {
+      return "";
+    }
+    const live = readRoomSessionId(this.room);
+    if (live.length > 0) {
+      this.localSessionId = live;
+      return live;
+    }
+    return this.localSessionId;
+  }
+
+  /** Normalized display name from the last join (matches server slice). */
+  getJoinDisplayName(): string {
+    return this.joinDisplayName;
+  }
+
   async join(options: JoinOptions, inviteRoomId: string | null): Promise<Room<any, ArenaState>> {
+    this.joinDisplayName = (options.name ?? "Runner").trim().slice(0, 18);
     if (this.room) {
+      this.refreshLocalSessionId();
       return this.room;
     }
 
-    this.room = inviteRoomId
-      ? await this.client
+    const joinPromise = inviteRoomId
+      ? this.client
           .joinById<ArenaState>(inviteRoomId, options, ArenaState)
           .catch(() => this.client.joinOrCreate<ArenaState>(ROOM_NAME, options, ArenaState))
-      : await this.client.joinOrCreate<ArenaState>(ROOM_NAME, options, ArenaState);
+      : this.client.joinOrCreate<ArenaState>(ROOM_NAME, options, ArenaState);
+    this.room = await withTimeout(joinPromise, 8000, "Joining arena");
 
+    this.refreshLocalSessionId();
     return this.room;
+  }
+
+  private refreshLocalSessionId(): void {
+    if (!this.room) {
+      this.localSessionId = "";
+      return;
+    }
+    const sid = readRoomSessionId(this.room);
+    if (sid.length > 0) this.localSessionId = sid;
   }
 
   sendInput(input: InputState): void {
@@ -40,5 +105,7 @@ export class NetClient {
   leave(): void {
     this.room?.leave();
     this.room = null;
+    this.localSessionId = "";
+    this.joinDisplayName = "";
   }
 }

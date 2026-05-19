@@ -6,7 +6,11 @@ import {
   BOOST_CHARGES_PER_LIFE,
   BOOST_COOLDOWN_MS,
   BOOST_DURATION_MS,
-  CAPTURE_DURATION_MS,
+  BULLET_RECHARGE_MS,
+  FLAG_STEAL_PROTECTION_MS,
+  getTeamCtfBaseRects,
+  PLAYER_MAX_BULLET_CHARGES,
+  PLAYER_RADIUS,
   ROUND_COUNTDOWN_MS,
   SPIKE_SLOW_DURATION_MS,
 } from "../../shared/src";
@@ -39,6 +43,29 @@ test("fire input creates a server projectile", () => {
   assert.equal(hasPlayerProjectile, true);
 });
 
+test("players have five bullets and spent bullets recharge after 30s", () => {
+  const state = new ArenaState();
+  const simulation = new GameSimulation(state);
+  simulation.addPlayer("p1", "Shooter");
+  const player = state.players.get("p1")!;
+  assert.equal(player.bulletCharges, PLAYER_MAX_BULLET_CHARGES);
+
+  simulation.update(ROUND_COUNTDOWN_MS);
+  state.phase = "live";
+  state.countdownMs = 0;
+
+  simulation.setInput("p1", { moveX: 0, moveY: 0, aimX: 1, aimY: 0, boost: false, fire: true });
+  simulation.update(16);
+  simulation.setInput("p1", { moveX: 0, moveY: 0, aimX: 1, aimY: 0, boost: false, fire: false });
+  assert.equal(player.bulletCharges, PLAYER_MAX_BULLET_CHARGES - 1);
+
+  simulation.update(BULLET_RECHARGE_MS - 1);
+  assert.equal(player.bulletCharges, PLAYER_MAX_BULLET_CHARGES - 1);
+
+  simulation.update(1);
+  assert.equal(player.bulletCharges, PLAYER_MAX_BULLET_CHARGES);
+});
+
 test("projectiles persist until they hit arena bounds", () => {
   const state = new ArenaState();
   const simulation = new GameSimulation(state);
@@ -64,12 +91,13 @@ test("projectiles push bots and enemy players, not just humans", () => {
   const botTarget = state.players.get("bot-target")!;
   shooter.team = "red";
   botTarget.team = "blue";
-  shooter.x = 800;
-  shooter.y = 800;
+  // Center of the arena so ensureBots perimeter spawns cannot sit on the shot line.
+  shooter.x = 6000;
+  shooter.y = 4000;
   shooter.vx = 0;
   shooter.vy = 0;
-  botTarget.x = 940;
-  botTarget.y = 800;
+  botTarget.x = 6800;
+  botTarget.y = 4000;
   botTarget.vx = 0;
   botTarget.vy = 0;
   botTarget.bulletCharges = 0;
@@ -182,7 +210,7 @@ test("countdown prevents movement and firing", () => {
   assert.equal(state.projectiles.size, 0);
 });
 
-test("circle capture awards a round point and resets countdown", () => {
+test("circle capture no longer awards a round point", () => {
   const state = new ArenaState();
   const simulation = new GameSimulation(state);
   simulation.addPlayer("p1", "Capturer");
@@ -199,10 +227,19 @@ test("circle capture awards a round point and resets countdown", () => {
     }
   }
 
-  simulation.update(CAPTURE_DURATION_MS + 200);
+  simulation.setInput("p1", { moveX: 0, moveY: 0, aimX: 1, aimY: 0, boost: false, fire: false });
+  const step = 40;
+  for (let t = 0; t < 8_000; t += step) {
+    const p1 = state.players.get("p1")!;
+    p1.x = state.captureX;
+    p1.y = state.captureY;
+    p1.vx = 200;
+    p1.vy = 0;
+    simulation.update(step);
+  }
 
-  assert.equal(state.redScore, 1);
-  assert.equal(state.phase, "countdown");
+  assert.equal(state.redScore, 0);
+  assert.equal(state.phase, "live");
   assert.equal(state.captureProgress, 0);
 });
 
@@ -249,25 +286,31 @@ test("direct projectile hit steals neutral flag from an enemy carrier", () => {
   assert.equal(neutral.carrierId, "human");
 });
 
-test("spike hit applies 10s slow and sets the permanent round penalty", () => {
+test("spike hit explodes the obstacle and applies slowdown without stopping movement", () => {
   const state = new ArenaState();
   const simulation = new GameSimulation(state);
   simulation.addPlayer("p1", "Walker");
   simulation.update(ROUND_COUNTDOWN_MS);
   const player = state.players.get("p1")!;
   const firstSpike = state.spikes.values().next().value!;
+  const initialSpikeCount = state.spikes.size;
   firstSpike.spikeKind = "standard";
   firstSpike.x = player.x;
   firstSpike.y = player.y;
   firstSpike.vx = 0;
   firstSpike.vy = 0;
+  player.vx = 123;
+  player.vy = -45;
 
   simulation.update(16);
 
-  assert.equal(player.spikePermSlow, true, "first spike hit should arm the permanent slow");
-  assert.equal(player.spikeSlowMs > 0, true, "first spike hit should set the 10s slow timer");
+  assert.equal(state.spikes.size, initialSpikeCount - 1, "hit spike should be consumed");
+  assert.equal(state.slowZones.size > 0, true, "hit spike should leave a slowdown explosion zone");
+  assert.equal(player.spikePermSlow, false, "spike slow should not apply a permanent penalty");
+  assert.equal(player.spikeSlowMs > 0, true, "first spike hit should set the timed slow");
   assert.equal(player.spikeSlowMs <= SPIKE_SLOW_DURATION_MS, true);
   assert.equal(player.stunnedMs, 0, "new spike behavior must not stun");
+  assert.equal(player.vx !== 0 || player.vy !== 0, true, "new spike behavior must not stop velocity");
 });
 
 test("boost requires a charge and starts a cooldown after the boost ends", () => {
@@ -326,6 +369,17 @@ test("team_ctf only balances red/blue and fills bots to four-vs-four", () => {
   assert.equal(state.players.size, 8, "team_ctf must backfill to 8 players (4v4)");
 });
 
+test("team_ctf bases are full-height left and right side strips", () => {
+  const bases = getTeamCtfBaseRects();
+  assert.equal(bases.red.minY, PLAYER_RADIUS);
+  assert.equal(bases.red.maxY, ARENA_HEIGHT - PLAYER_RADIUS);
+  assert.equal(bases.blue.minY, PLAYER_RADIUS);
+  assert.equal(bases.blue.maxY, ARENA_HEIGHT - PLAYER_RADIUS);
+  assert.equal(bases.red.minX < bases.blue.minX, true);
+  assert.equal(bases.red.maxX < ARENA_WIDTH * 0.2, true);
+  assert.equal(bases.blue.minX > ARENA_WIDTH * 0.8, true);
+});
+
 test("solo FFA assigns unique ffaN teams across 8 vertex bases", () => {
   const state = new ArenaState();
   const simulation = new GameSimulation(state);
@@ -382,4 +436,257 @@ test("direct projectile hit does not steal flag from a teammate", () => {
   simulation.update(220);
 
   assert.equal(neutral.carrierId, "victim");
+});
+
+test("bumping an enemy carrier steals their flag", () => {
+  const state = new ArenaState();
+  const simulation = new GameSimulation(state);
+  simulation.addPlayer("thief", "Thief");
+  simulation.addPlayer("carrier", "Carrier");
+  simulation.update(ROUND_COUNTDOWN_MS);
+
+  const neutral = state.flags.get("flag-neutral");
+  assert.ok(neutral);
+
+  const thief = state.players.get("thief")!;
+  const carrier = state.players.get("carrier")!;
+  thief.team = "red";
+  carrier.team = "blue";
+  thief.x = 2000;
+  thief.y = 2000;
+  thief.vx = 280;
+  thief.vy = 0;
+  carrier.x = 2000 + 10;
+  carrier.y = 2000;
+  carrier.vx = 0;
+  carrier.vy = 0;
+  neutral.carrierId = carrier.id;
+  neutral.atBase = false;
+
+  for (const other of state.players.values()) {
+    if (other.id === "thief" || other.id === "carrier") continue;
+    other.alive = false;
+  }
+
+  simulation.update(16);
+
+  assert.equal(neutral.carrierId, "thief");
+});
+
+test("bot bumping a human carrier steals their flag", () => {
+  const state = new ArenaState();
+  const simulation = new GameSimulation(state);
+  simulation.addPlayer("human-carrier", "Carrier");
+  simulation.addPlayer("bot-thief", "Bot", true);
+  simulation.update(ROUND_COUNTDOWN_MS);
+
+  const neutral = state.flags.get("flag-neutral");
+  assert.ok(neutral);
+
+  const humanCarrier = state.players.get("human-carrier")!;
+  const botThief = state.players.get("bot-thief")!;
+  humanCarrier.team = "red";
+  botThief.team = "blue";
+  humanCarrier.x = 2400;
+  humanCarrier.y = 2400;
+  humanCarrier.vx = 0;
+  humanCarrier.vy = 0;
+  botThief.x = 2410;
+  botThief.y = 2400;
+  botThief.vx = 260;
+  botThief.vy = 0;
+  neutral.carrierId = humanCarrier.id;
+  neutral.atBase = false;
+
+  for (const other of state.players.values()) {
+    if (other.id === "human-carrier" || other.id === "bot-thief") continue;
+    other.alive = false;
+  }
+
+  simulation.update(16);
+
+  assert.equal(neutral.carrierId, "bot-thief");
+});
+
+test("faster carrier wins an enemy carrier bump interception", () => {
+  const state = new ArenaState();
+  const simulation = new GameSimulation(state);
+  state.gameMode = "team_ctf";
+  simulation.addPlayer("red-carrier", "Red");
+  simulation.addPlayer("blue-carrier", "Blue");
+  simulation.restartMatch();
+
+  const redFlag = state.flags.get("flag-red");
+  const blueFlag = state.flags.get("flag-blue");
+  assert.ok(redFlag);
+  assert.ok(blueFlag);
+
+  const redCarrier = state.players.get("red-carrier")!;
+  const blueCarrier = state.players.get("blue-carrier")!;
+  redCarrier.team = "red";
+  blueCarrier.team = "blue";
+  redCarrier.x = 2200;
+  redCarrier.y = 2200;
+  redCarrier.vx = 420;
+  redCarrier.vy = 0;
+  blueCarrier.x = 2210;
+  blueCarrier.y = 2200;
+  blueCarrier.vx = 40;
+  blueCarrier.vy = 0;
+  redFlag.carrierId = blueCarrier.id;
+  blueFlag.carrierId = redCarrier.id;
+  redFlag.atBase = false;
+  blueFlag.atBase = false;
+
+  for (const other of state.players.values()) {
+    if (other.id === "red-carrier" || other.id === "blue-carrier") continue;
+    other.alive = false;
+  }
+
+  simulation.update(16);
+
+  assert.equal(redFlag.carrierId, "red-carrier");
+  assert.equal(blueFlag.carrierId, "red-carrier");
+});
+
+test("bots close on an enemy neutral flag carrier instead of standing off", () => {
+  const state = new ArenaState();
+  const simulation = new GameSimulation(state);
+  simulation.addPlayer("human", "Carrier");
+  simulation.addPlayer("bot-hunter", "Bot", true);
+  simulation.update(ROUND_COUNTDOWN_MS);
+
+  const neutral = state.flags.get("flag-neutral");
+  assert.ok(neutral);
+
+  const human = state.players.get("human")!;
+  const bot = state.players.get("bot-hunter")!;
+  human.team = "red";
+  bot.team = "blue";
+  human.x = 3200;
+  human.y = 4000;
+  human.vx = 0;
+  human.vy = 0;
+  bot.x = 5200;
+  bot.y = 4000;
+  bot.vx = 0;
+  bot.vy = 0;
+  bot.bulletCharges = 0;
+  neutral.carrierId = human.id;
+  neutral.atBase = false;
+
+  for (const id of [...state.players.keys()]) {
+    if (id === "human" || id === "bot-hunter") continue;
+    simulation.removePlayer(id);
+  }
+
+  const distanceBefore = Math.hypot(bot.x - human.x, bot.y - human.y);
+  simulation.update(800);
+  const distanceAfter = Math.hypot(bot.x - human.x, bot.y - human.y);
+  assert.equal(neutral.carrierId, human.id);
+  assert.ok(distanceAfter < distanceBefore, "bot should close distance to the flag carrier");
+});
+
+test("bots pace shots instead of dumping full magazines instantly", () => {
+  const state = new ArenaState();
+  const simulation = new GameSimulation(state);
+  simulation.addPlayer("human", "Target");
+  simulation.addPlayer("bot-shooter", "Bot", true);
+  simulation.update(ROUND_COUNTDOWN_MS);
+
+  const human = state.players.get("human")!;
+  const bot = state.players.get("bot-shooter")!;
+  human.team = "red";
+  bot.team = "blue";
+  human.x = 5000;
+  human.y = 4000;
+  bot.x = 5400;
+  bot.y = 4000;
+  bot.bulletCharges = PLAYER_MAX_BULLET_CHARGES;
+  bot.pushCooldownMs = 0;
+
+  for (const other of state.players.values()) {
+    if (other.id === "human" || other.id === "bot-shooter") continue;
+    other.alive = false;
+  }
+
+  state.projectiles.clear();
+  simulation.update(700);
+
+  const botShots = [...state.projectiles.values()].filter((p) => p.ownerId === "bot-shooter").length;
+  assert.ok(botShots <= 1, `expected at most one bot shot in 700ms, got ${botShots}`);
+});
+
+test("stolen flag cannot be taken back until steal protection expires", () => {
+  const state = new ArenaState();
+  const simulation = new GameSimulation(state);
+  simulation.addPlayer("thief", "Thief");
+  simulation.addPlayer("carrier", "Carrier");
+  simulation.addPlayer("chaser", "Chaser");
+  simulation.update(ROUND_COUNTDOWN_MS);
+
+  const neutral = state.flags.get("flag-neutral");
+  assert.ok(neutral);
+
+  const thief = state.players.get("thief")!;
+  const carrier = state.players.get("carrier")!;
+  const chaser = state.players.get("chaser")!;
+  thief.team = "red";
+  carrier.team = "blue";
+  chaser.team = "green";
+  carrier.x = 3000;
+  carrier.y = 4000;
+  carrier.vx = 280;
+  carrier.vy = 0;
+  thief.x = 3010;
+  thief.y = 4000;
+  thief.vx = 300;
+  thief.vy = 0;
+  chaser.x = 3020;
+  chaser.y = 4000;
+  chaser.vx = 300;
+  chaser.vy = 0;
+  neutral.carrierId = carrier.id;
+  neutral.atBase = false;
+
+  for (const other of state.players.values()) {
+    if (other.id === "thief" || other.id === "carrier" || other.id === "chaser") continue;
+    other.alive = false;
+  }
+
+  simulation.update(16);
+  assert.equal(neutral.carrierId, "thief");
+  assert.ok(neutral.stealProtectionMs > FLAG_STEAL_PROTECTION_MS - 50);
+
+  chaser.x = thief.x + 8;
+  chaser.y = thief.y;
+  chaser.vx = 300;
+  simulation.update(16);
+  assert.equal(neutral.carrierId, "thief", "immediate re-steal should be blocked");
+
+  simulation.update(FLAG_STEAL_PROTECTION_MS + 50);
+  chaser.x = thief.x + 8;
+  chaser.vx = 320;
+  simulation.update(16);
+  assert.equal(neutral.carrierId, "chaser", "steal should succeed after protection ends");
+});
+
+test("spike slow clears on round restart", () => {
+  const state = new ArenaState();
+  const simulation = new GameSimulation(state);
+  simulation.addPlayer("p1", "Walker");
+  simulation.update(ROUND_COUNTDOWN_MS);
+  const player = state.players.get("p1")!;
+  const firstSpike = state.spikes.values().next().value!;
+  firstSpike.x = player.x;
+  firstSpike.y = player.y;
+  firstSpike.vx = 0;
+  firstSpike.vy = 0;
+  simulation.update(16);
+  assert.equal(player.spikeSlowMs > 0, true);
+
+  simulation.restartMatch();
+  const after = state.players.get("p1")!;
+  assert.equal(after.spikeSlowMs, 0);
+  assert.equal(after.spikePermSlow, false);
 });

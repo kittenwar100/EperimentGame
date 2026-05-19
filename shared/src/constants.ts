@@ -1,6 +1,8 @@
 export const GAME_NAME = "Core Surge Grid Clash";
 export const ROOM_NAME = "core-surge-grid-clash";
 export const SERVER_TICK_RATE = 30;
+/** State/input cadence target for smoother client motion without going all the way to 60Hz. */
+export const NETWORK_UPDATE_RATE = 30;
 
 export const MATCH_DURATION_MS = 240_000;
 /** FFA rounds use this cap (flag score ends earlier). First {@link FFA_FRENZY_AFTER_MS} are normal; then frenzy rules apply. */
@@ -20,6 +22,8 @@ export const PLAYER_RESPAWN_MS = 2500;
 export const PLAYER_BASE_ACCEL = 700;
 export const PLAYER_MAX_SPEED = 310;
 export const PLAYER_DRAG = 0.9985;
+/** Baseline movement tuning. 1 / 1.5 makes normal movement 1.5x slower. */
+export const NORMAL_MOVE_SPEED_MULTIPLIER = 1 / 1.5;
 export const BOOST_DURATION_MS = 5000;
 export const BOOST_SPEED_MULTIPLIER = 2.0;
 export const BOOST_CHARGES_PER_LIFE = 4;
@@ -28,14 +32,18 @@ export const BOOST_COOLDOWN_MS = 10_000;
 export const SPIKE_SLOW_DURATION_MS = 10_000;
 /** Speed factor while in the 10s spike slow window. 0.25 = 75% slower. */
 export const SPIKE_SLOW_MULTIPLIER = 0.25;
-/** Speed factor for the per-round permanent penalty after first spike hit. 0.75 = 25% slower. */
-export const SPIKE_PERM_SLOW_MULTIPLIER = 0.75;
+/** Speed factor for the per-round permanent penalty after first spike hit. 0.95 = 5% slower. @deprecated No longer applied; spike slow is timed only. */
+export const SPIKE_PERM_SLOW_MULTIPLIER = 0.95;
+/** After stealing a flag from another player, it cannot be stolen again for this long. */
+export const FLAG_STEAL_PROTECTION_MS = 3000;
 export const MAX_BOTS = 8;
 export const DESIRED_PLAYERS = 6;
-export const INPUT_SEND_RATE_MS = 50;
+export const INPUT_SEND_RATE_MS = 1000 / NETWORK_UPDATE_RATE;
 export const PICKUP_RESPAWN_MS = 7000;
 export const PICKUP_RADIUS = 54;
 export const PUSH_COOLDOWN_MS = 700;
+export const PLAYER_MAX_BULLET_CHARGES = 5;
+export const BULLET_RECHARGE_MS = 30_000;
 export const PROJECTILE_SPEED = 1960;
 export const PROJECTILE_RADIUS = 135;
 export const PROJECTILE_MAX_RANGE = 920;
@@ -51,6 +59,54 @@ export const ROUND_COUNTDOWN_MS = 3000;
 export const SPEED_POWERUP_DURATION_MS = 3200;
 export const EXTRA_BULLET_CHARGES = 2;
 export const SAFE_ZONE_SIZE = PLAYER_RADIUS * 35;
+
+/** 4v4 team CTF: full-height side bases, like race spawn strips mirrored left/right. */
+export const TEAM_CTF_BASE_WIDTH = ARENA_WIDTH * 0.12;
+export const TEAM_CTF_BASE_HEIGHT = ARENA_HEIGHT - PLAYER_RADIUS * 2;
+
+export type AxisAlignedRect = { minX: number; minY: number; maxX: number; maxY: number };
+
+/** Red left side, blue right side. Both bases touch the top and bottom arena edges. */
+export function getTeamCtfBaseRects(): { red: AxisAlignedRect; blue: AxisAlignedRect } {
+  const baseMinX = PLAYER_RADIUS;
+  const baseMinY = PLAYER_RADIUS;
+  const baseMaxX = ARENA_WIDTH - PLAYER_RADIUS;
+  const baseMaxY = ARENA_HEIGHT - PLAYER_RADIUS;
+  return {
+    red: {
+      minX: baseMinX,
+      minY: baseMinY,
+      maxX: baseMinX + TEAM_CTF_BASE_WIDTH,
+      maxY: baseMaxY,
+    },
+    blue: {
+      minX: baseMaxX - TEAM_CTF_BASE_WIDTH,
+      minY: baseMinY,
+      maxX: baseMaxX,
+      maxY: baseMaxY,
+    },
+  };
+}
+
+/** Race mode: left spawn band (everyone starts inside this strip). */
+export const RACE_SPAWN_BAND_MIN_X = PLAYER_RADIUS;
+export const RACE_SPAWN_BAND_MAX_X = ARENA_WIDTH * 0.12;
+/** Horizontal padding so spawns stay clearly inside the drawn base. */
+export const RACE_SPAWN_IN_BAND_PAD_X = 70;
+/** Vertical span for race starts (cluster in the “home” mid-arena). */
+export const RACE_SPAWN_IN_BAND_Y_MIN_FRAC = 0.22;
+export const RACE_SPAWN_IN_BAND_Y_MAX_FRAC = 0.78;
+/** Neutral flag sits on the far right in race mode. */
+export const RACE_FLAG_HOME_X = ARENA_WIDTH * 0.92;
+export const RACE_FLAG_HOME_Y = ARENA_HEIGHT * 0.5;
+
+/** Center of the race start strip (everyone lines up here). */
+export const RACE_HOME_BASE_X = (RACE_SPAWN_BAND_MIN_X + RACE_SPAWN_BAND_MAX_X) * 0.5;
+export const RACE_HOME_BASE_Y = ARENA_HEIGHT * 0.5;
+/** 2×4 grid spacing so eight starters stay inside the band without overlapping. */
+export const RACE_BASE_GRID_STEP_X = 54;
+export const RACE_BASE_GRID_STEP_Y = 56;
+
 export const SPIKE_COUNT = 5;
 export const SPIKE_RADIUS = PLAYER_RADIUS * 2.7;
 export const SPIKE_STUN_MS = 1000;

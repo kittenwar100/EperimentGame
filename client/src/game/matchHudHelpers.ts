@@ -4,16 +4,16 @@ import {
   FFA_CORNER_BASE_ZONE_RADIUS,
   FFA_TEAM_IDS,
   PLAYER_RADIUS,
+  RACE_HOME_BASE_X,
+  RACE_HOME_BASE_Y,
   SAFE_ZONE_SIZE,
   ffaTeamHomeCenter,
+  getTeamCtfBaseRects,
   type ArenaState,
   type PlayerState,
 } from "@shared";
 
 const NEUTRAL_FLAG_ID = "flag-neutral";
-const RACE_SPAWN_BAND_MAX_X = ARENA_WIDTH * 0.12;
-const RACE_FLAG_HOME_X = ARENA_WIDTH * 0.92;
-const RACE_FLAG_HOME_Y = ARENA_HEIGHT * 0.5;
 
 function isFfaMode(state: ArenaState): boolean {
   return state.gameMode === "ffa";
@@ -25,17 +25,20 @@ function teamHomeCenter(team: string, gameMode?: string): { x: number; y: number
     if (o) return o;
   }
   if (gameMode === "race") {
-    return { x: (PLAYER_RADIUS + RACE_SPAWN_BAND_MAX_X) * 0.5, y: ARENA_HEIGHT * 0.5 };
+    return { x: RACE_HOME_BASE_X, y: RACE_HOME_BASE_Y };
   }
   const baseMinX = PLAYER_RADIUS;
   const baseMinY = PLAYER_RADIUS;
   const baseMaxX = ARENA_WIDTH - PLAYER_RADIUS;
   const baseMaxY = ARENA_HEIGHT - PLAYER_RADIUS;
-  const half = SAFE_ZONE_SIZE * 0.5;
   if (gameMode === "team_ctf") {
-    if (team === "blue") return { x: baseMaxX - half, y: baseMaxY - half };
-    return { x: baseMinX + half, y: baseMinY + half };
+    const ctf = getTeamCtfBaseRects();
+    if (team === "blue") {
+      return { x: (ctf.blue.minX + ctf.blue.maxX) * 0.5, y: (ctf.blue.minY + ctf.blue.maxY) * 0.5 };
+    }
+    return { x: (ctf.red.minX + ctf.red.maxX) * 0.5, y: (ctf.red.minY + ctf.red.maxY) * 0.5 };
   }
+  const half = SAFE_ZONE_SIZE * 0.5;
   if (team === "blue") return { x: baseMaxX - half, y: baseMinY + half };
   if (team === "green") return { x: baseMinX + half, y: baseMaxY - half };
   if (team === "yellow") return { x: baseMaxX - half, y: baseMaxY - half };
@@ -62,10 +65,17 @@ export function getObjectiveWorldTarget(state: ArenaState, local: PlayerState): 
     const carrier = state.players.get(neutral.carrierId);
     if (carrier?.alive) {
       const steal = neutral.carrierId !== local.id;
+      const protectedMs = neutral.stealProtectionMs ?? 0;
       return {
         x: carrier.x,
         y: carrier.y,
-        hint: steal ? "Enemy has the flag — direct blast steals it" : "",
+        hint: steal
+          ? protectedMs > 0
+            ? "Enemy flag secured — wait to bump or shoot"
+            : "Enemy has the flag — bump or shoot to steal"
+          : protectedMs > 0
+            ? `Flag secured (${Math.ceil(protectedMs / 1000)}s)`
+            : "",
       };
     }
   }
@@ -107,19 +117,20 @@ export function isInEnemySafeZone(
   const baseMinY = PLAYER_RADIUS;
   const baseMaxX = ARENA_WIDTH - PLAYER_RADIUS;
   const baseMaxY = ARENA_HEIGHT - PLAYER_RADIUS;
-  const allZones: Array<{ team: string; minX: number; minY: number; maxX: number; maxY: number }> = [
-    { team: "red", minX: baseMinX, minY: baseMinY, maxX: baseMinX + SAFE_ZONE_SIZE, maxY: baseMinY + SAFE_ZONE_SIZE },
-    { team: "blue", minX: baseMaxX - SAFE_ZONE_SIZE, minY: baseMinY, maxX: baseMaxX, maxY: baseMinY + SAFE_ZONE_SIZE },
-    { team: "green", minX: baseMinX, minY: baseMaxY - SAFE_ZONE_SIZE, maxX: baseMinX + SAFE_ZONE_SIZE, maxY: baseMaxY },
-    { team: "yellow", minX: baseMaxX - SAFE_ZONE_SIZE, minY: baseMaxY - SAFE_ZONE_SIZE, maxX: baseMaxX, maxY: baseMaxY },
-  ];
-  // Team CTF places blue at bottom-right (matches server initializeTeamCtfFlags layout).
-  const zones = state?.gameMode === "team_ctf"
-    ? [
-        { team: "red", minX: baseMinX, minY: baseMinY, maxX: baseMinX + SAFE_ZONE_SIZE, maxY: baseMinY + SAFE_ZONE_SIZE },
-        { team: "blue", minX: baseMaxX - SAFE_ZONE_SIZE, minY: baseMaxY - SAFE_ZONE_SIZE, maxX: baseMaxX, maxY: baseMaxY },
-      ]
-    : allZones;
+  const ctf = getTeamCtfBaseRects();
+  // Team CTF: red top-left, blue bottom-right (matches server collision + flags).
+  const zones =
+    state?.gameMode === "team_ctf"
+      ? [
+          { team: "red", ...ctf.red },
+          { team: "blue", ...ctf.blue },
+        ]
+      : [
+          { team: "red", minX: baseMinX, minY: baseMinY, maxX: baseMinX + SAFE_ZONE_SIZE, maxY: baseMinY + SAFE_ZONE_SIZE },
+          { team: "blue", minX: baseMaxX - SAFE_ZONE_SIZE, minY: baseMinY, maxX: baseMaxX, maxY: baseMinY + SAFE_ZONE_SIZE },
+          { team: "green", minX: baseMinX, minY: baseMaxY - SAFE_ZONE_SIZE, maxX: baseMinX + SAFE_ZONE_SIZE, maxY: baseMaxY },
+          { team: "yellow", minX: baseMaxX - SAFE_ZONE_SIZE, minY: baseMaxY - SAFE_ZONE_SIZE, maxX: baseMaxX, maxY: baseMaxY },
+        ];
   return zones.some(
     (z) =>
       z.team !== myTeam &&

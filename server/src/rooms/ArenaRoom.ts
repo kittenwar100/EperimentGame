@@ -1,5 +1,5 @@
 import { Client, Room } from "colyseus";
-import { SERVER_TICK_RATE, ROOM_NAME, type GameModeId, type InputState, type JoinOptions } from "../../../shared/src/index";
+import { NETWORK_UPDATE_RATE, SERVER_TICK_RATE, ROOM_NAME, type GameModeId, type InputState, type JoinOptions } from "../../../shared/src/index";
 import { GameSimulation } from "../simulation";
 import { ArenaState } from "../state";
 
@@ -14,7 +14,7 @@ export class ArenaRoom extends Room<{ state: ArenaState }> {
   override onCreate(): void {
     this.setState(this.roomState);
     this.autoDispose = false;
-    this.patchRate = 1000 / 20;
+    this.patchRate = 1000 / NETWORK_UPDATE_RATE;
 
     this.onMessage("input", (client, input: InputState) => {
       this.simulation.setInput(client.sessionId, input);

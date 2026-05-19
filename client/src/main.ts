@@ -34,10 +34,10 @@ async function bootstrap(): Promise<void> {
     autoFocus: true,
     fps: {
       target: 60,
-      smoothStep: false,
+      smoothStep: true,
     },
     render: {
-      antialias: false,
+      antialias: true,
       powerPreference: "high-performance",
     },
     scale: {
