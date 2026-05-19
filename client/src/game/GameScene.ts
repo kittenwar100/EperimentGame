@@ -571,8 +571,11 @@ export class GameScene extends Phaser.Scene {
     const graphics = this.arenaGraphics;
     const width = this.scale.width;
     const height = this.scale.height;
-    const theme = MAP_THEMES[Math.min(MAP_THEMES.length - 1, Math.max(0, Math.floor(state.mapTheme)))];
-    const backdropKey = `${state.mapTheme}|${state.gameMode}|${Math.round(width)}x${Math.round(height)}`;
+    const rawMapTheme = Number.isFinite(state.mapTheme) ? Math.floor(state.mapTheme) : 0;
+    const themeIndex = Math.min(MAP_THEMES.length - 1, Math.max(0, rawMapTheme));
+    const theme = MAP_THEMES[themeIndex];
+    if (!theme) return;
+    const backdropKey = `${themeIndex}|${state.gameMode ?? ""}|${Math.round(width)}x${Math.round(height)}`;
     if (backdropKey !== this.lastArenaBackdropKey) {
       this.lastArenaBackdropKey = backdropKey;
       const bg = this.arenaBackdropGraphics;
