@@ -356,6 +356,31 @@ test("releasing space mid-boost ends the boost immediately and starts the cooldo
   assert.equal(player.boostCooldownMs > 0, true, "cooldown must engage when boost ends");
 });
 
+test("team_ctf assigns a second human to the opposite team and keeps four-vs-four", () => {
+  const state = new ArenaState();
+  const simulation = new GameSimulation(state);
+  state.gameMode = "team_ctf";
+  simulation.addPlayer("h1", "Pilot");
+  simulation.update(16);
+  const botBefore = [...state.players.values()].find((p) => p.isBot && p.team === "blue")!;
+  const botX = botBefore.x;
+  const botY = botBefore.y;
+  simulation.addHumanReplacingBot("h2", "Friend");
+  simulation.update(16);
+
+  const h1 = state.players.get("h1")!;
+  const h2 = state.players.get("h2")!;
+  assert.notEqual(h1.team, h2.team, "humans should be on opposite teams in team CTF");
+  assert.equal(h2.team, "blue", "second human should take the blue bot slot");
+  assert.equal(Math.hypot(h2.x - botX, h2.y - botY) < 1, true, "human should spawn where the bot was");
+  assert.equal(state.players.size, 8, "team_ctf must stay at 8 players (humans replace bots)");
+
+  const redCount = [...state.players.values()].filter((p) => p.team === "red").length;
+  const blueCount = [...state.players.values()].filter((p) => p.team === "blue").length;
+  assert.equal(redCount, 4);
+  assert.equal(blueCount, 4);
+});
+
 test("team_ctf only balances red/blue and fills bots to four-vs-four", () => {
   const state = new ArenaState();
   const simulation = new GameSimulation(state);
@@ -380,19 +405,68 @@ test("team_ctf bases are full-height left and right side strips", () => {
   assert.equal(bases.blue.minX > ARENA_WIDTH * 0.8, true);
 });
 
-test("solo FFA assigns unique ffaN teams across 8 vertex bases", () => {
+test("solo FFA with one human has no bots and a unique solo team", () => {
   const state = new ArenaState();
   const simulation = new GameSimulation(state);
   state.gameMode = "ffa";
   simulation.addPlayer("h1", "Pilot");
   simulation.update(16);
+  assert.equal(state.players.size, 1, "solo FFA with one human stays at 1 player");
+  assert.equal([...state.players.values()].filter((p) => p.isBot).length, 0, "solo FFA must not backfill bots");
+  assert.equal(state.players.get("h1")!.team.startsWith("ffa"), true);
+});
+
+test("solo FFA two humans each get a unique solo color team with no bots", () => {
+  const state = new ArenaState();
+  const simulation = new GameSimulation(state);
+  state.gameMode = "ffa";
+  simulation.addPlayer("h1", "Pilot");
+  simulation.update(16);
+  simulation.addHumanReplacingBot("h2", "Friend");
+  simulation.update(16);
+
+  const h1 = state.players.get("h1")!;
+  const h2 = state.players.get("h2")!;
+  assert.notEqual(h1.team, h2.team, "solo FFA humans must never share a team");
+  assert.equal(state.players.size, 2, "solo FFA with two humans stays at 2 players");
+  assert.equal([...state.players.values()].filter((p) => p.isBot).length, 0, "solo FFA must not backfill bots");
+
+  const humanTeams = [...state.players.values()].filter((p) => !p.isBot).map((p) => p.team);
+  assert.equal(new Set(humanTeams).size, 2, "each human must occupy a distinct solo team slot");
+});
+
+test("solo FFA enforces one player per base when duplicate teams appear", () => {
+  const state = new ArenaState();
+  const simulation = new GameSimulation(state);
+  state.gameMode = "ffa";
+  simulation.addPlayer("h1", "Pilot");
+  simulation.addPlayer("h2", "Friend");
+  state.players.get("h2")!.team = state.players.get("h1")!.team;
+  simulation.update(16);
+
+  assert.equal(state.players.size, 2, "both humans must stay in the match");
   const teams = [...state.players.values()].map((p) => p.team);
-  const unique = new Set(teams);
-  assert.equal(state.players.size, 8, "solo FFA fills to 8 players total");
-  assert.equal(unique.size, 8, "every player must be on a unique solo team id");
-  for (const team of teams) {
-    assert.equal(team.startsWith("ffa"), true, `expected ffaN team id, got ${team}`);
-  }
+  assert.equal(new Set(teams).size, teams.length, "duplicate solo teams must be reassigned to open bases");
+  assert.equal([...state.players.values()].filter((p) => p.isBot).length, 0);
+});
+
+test("solo FFA second human replacing a bot inherits that bot slot when bots exist", () => {
+  const state = new ArenaState();
+  const simulation = new GameSimulation(state);
+  state.gameMode = "ffa";
+  simulation.addPlayer("h1", "Pilot");
+  simulation.addPlayer("bot-1", "", true);
+  const botBefore = state.players.get("bot-1")!;
+  const botTeam = botBefore.team;
+  const botX = botBefore.x;
+  const botY = botBefore.y;
+  simulation.addHumanReplacingBot("h2", "Friend");
+
+  const h1 = state.players.get("h1")!;
+  const h2 = state.players.get("h2")!;
+  assert.notEqual(h1.team, h2.team);
+  assert.equal(h2.team, botTeam);
+  assert.equal(Math.hypot(h2.x - botX, h2.y - botY) < 1, true);
 });
 
 test("direct projectile hit does not steal flag from a teammate", () => {

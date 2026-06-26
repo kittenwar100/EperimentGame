@@ -2,7 +2,7 @@ export const GAME_NAME = "Core Surge Grid Clash";
 export const ROOM_NAME = "core-surge-grid-clash";
 export const SERVER_TICK_RATE = 30;
 /** State/input cadence target for smoother client motion without going all the way to 60Hz. */
-export const NETWORK_UPDATE_RATE = 30;
+export const NETWORK_UPDATE_RATE = 60;
 
 export const MATCH_DURATION_MS = 240_000;
 /** FFA rounds use this cap (flag score ends earlier). First {@link FFA_FRENZY_AFTER_MS} are normal; then frenzy rules apply. */
@@ -37,6 +37,8 @@ export const SPIKE_PERM_SLOW_MULTIPLIER = 0.95;
 /** After stealing a flag from another player, it cannot be stolen again for this long. */
 export const FLAG_STEAL_PROTECTION_MS = 3000;
 export const MAX_BOTS = 8;
+/** Max human clients per Colyseus room; a 9th player matchmakes into a new room. */
+export const MAX_PLAYERS_PER_ROOM = 8;
 export const DESIRED_PLAYERS = 6;
 export const INPUT_SEND_RATE_MS = 1000 / NETWORK_UPDATE_RATE;
 export const PICKUP_RESPAWN_MS = 7000;
@@ -57,7 +59,11 @@ export const CAPTURE_RADIUS = 220;
 export const CAPTURE_DURATION_MS = 5200;
 export const ROUND_COUNTDOWN_MS = 3000;
 export const SPEED_POWERUP_DURATION_MS = 3200;
+/** Move speed multiplier while the yellow speed pickup is active. */
+export const SPEED_POWERUP_MULTIPLIER = 1.55;
 export const EXTRA_BULLET_CHARGES = 2;
+export const PICKUP_MAGNET_DURATION_MS = 5200;
+export const PICKUP_REPEL_DURATION_MS = 4800;
 export const SAFE_ZONE_SIZE = PLAYER_RADIUS * 35;
 
 /** 4v4 team CTF: full-height side bases, like race spawn strips mirrored left/right. */

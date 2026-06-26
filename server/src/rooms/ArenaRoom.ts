@@ -1,5 +1,13 @@
 import { Client, Room } from "colyseus";
-import { NETWORK_UPDATE_RATE, SERVER_TICK_RATE, ROOM_NAME, type GameModeId, type InputState, type JoinOptions } from "../../../shared/src/index";
+import {
+  MAX_PLAYERS_PER_ROOM,
+  NETWORK_UPDATE_RATE,
+  SERVER_TICK_RATE,
+  ROOM_NAME,
+  type GameModeId,
+  type InputState,
+  type JoinOptions,
+} from "../../../shared/src/index";
 import { GameSimulation } from "../simulation";
 import { ArenaState } from "../state";
 
@@ -9,10 +17,13 @@ function resolveMode(mode: GameModeId | undefined): GameModeId {
 }
 
 export class ArenaRoom extends Room<{ state: ArenaState }> {
+  override maxClients = MAX_PLAYERS_PER_ROOM;
+
   private readonly roomState = new ArenaState();
   private readonly simulation = new GameSimulation(this.roomState);
-  override onCreate(): void {
+  override onCreate(options: JoinOptions = {}): void {
     this.setState(this.roomState);
+    this.roomState.gameMode = resolveMode(options.mode);
     this.autoDispose = false;
     this.patchRate = 1000 / NETWORK_UPDATE_RATE;
 
@@ -35,11 +46,14 @@ export class ArenaRoom extends Room<{ state: ArenaState }> {
     if (humansBefore === 0) {
       this.roomState.gameMode = resolveMode(options.mode);
     }
-    this.simulation.addPlayer(client.sessionId, (options.name ?? "Runner").slice(0, 18), false);
-    // First human: reset match, fill with bots, no join countdown. Extra humans: drop in mid-match.
+    const displayName = (options.name ?? "Runner").slice(0, 18);
     if (humansBefore === 0) {
+      this.simulation.addPlayer(client.sessionId, displayName, false);
       this.simulation.restartMatch();
+    } else {
+      this.simulation.addHumanReplacingBot(client.sessionId, displayName);
     }
+    this.simulation.finalizeSoloFfaHumanPlacement(client.sessionId);
   }
 
   override onLeave(client: Client): void {

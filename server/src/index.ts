@@ -16,12 +16,12 @@ const gameServer = new Server({
     );
 
     app.get("/health", (_req, res) => {
-      res.json({ ok: true, service: "core-surge-server" });
+      res.json({ ok: true, service: "core-surge-server", build: "solo-ffa-v2" });
     });
   },
 });
 
-gameServer.define(roomName, ArenaRoom);
+gameServer.define(roomName, ArenaRoom).filterBy(["mode"]);
 
 void gameServer.listen(port).then(() => {
   console.log(`Core Surge server listening on http://localhost:${port}`);

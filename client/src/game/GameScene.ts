@@ -31,7 +31,7 @@ import {
   type ProjectileState,
   type SpikeState,
 } from "@shared";
-import { getObjectiveWorldTarget, isInEnemySafeZone, objectiveScreenMarker } from "./matchHudHelpers";
+import { getModeLabel, getObjectiveWorldTarget, isInEnemySafeZone, objectiveScreenMarker } from "./matchHudHelpers";
 import type { SfxController } from "../audio/SfxController";
 import type { NetClient } from "../network/NetClient";
 import type { CrazyGamesService } from "../sdk/CrazyGamesService";
@@ -43,13 +43,13 @@ const PICKUP_COLORS: Record<string, number> = {
   magnet: 0xff9c5c,
   repel: 0xc07dff,
 };
-/** Short labels for the HUD legend / leaderboard panel (not drawn on the world pickup itself). */
-const PICKUP_LABELS: Record<string, string> = {
-  speed: "Overdrive",
-  ammo: "Recharge",
-  shield: "Shield",
-  magnet: "Magnet",
-  repel: "Repel",
+/** Short label drawn under each pickup in the world. */
+const PICKUP_WORLD_LABELS: Record<string, string> = {
+  speed: "SPEED UP",
+  ammo: "+2 SHOTS",
+  shield: "1-HIT BLOCK",
+  magnet: "PULL LOOT",
+  repel: "PUSH FOES",
 };
 type MapTheme = {
   bg1: number;
@@ -134,7 +134,7 @@ const OCTAGON_SOLO_FFA_SLOTS: readonly { team: string; vertexIndex: number }[] =
   { team: "ffa6", vertexIndex: 6 },
   { team: "ffa7", vertexIndex: 7 },
 ];
-const CAMERA_VIEW_WIDTH_WORLD = 1850;
+const CAMERA_VIEW_WIDTH_WORLD = 1850 * 2;
 const PLAYER_BODY_RADIUS_PX = 32;
 const PLAYER_SIZE_MULTIPLIER = 2.5;
 const LOCAL_PLAYER_SCALE_MULTIPLIER = 1.24;
@@ -144,10 +144,11 @@ const VIEWPORT_BORDER_ALPHA = 1;
 const VIEWPORT_BORDER_WIDTH = 16;
 const PROGRESSION_MILESTONES = [40, 90, 150];
 /** Camera focus lerps toward arena center only while the local player is not available yet. */
-const CAMERA_FOLLOW_SMOOTH_MS = 14;
+const CAMERA_FOLLOW_SMOOTH_MS = 42;
+const LOCAL_PLAYER_SMOOTH_MS = 24;
 /** Remote entities are smoothed in world space so camera movement does not add screen-space jitter. */
-const REMOTE_PLAYER_WORLD_SMOOTH_MS = 34;
-const PROJECTILE_WORLD_SMOOTH_MS = 18;
+const REMOTE_PLAYER_WORLD_SMOOTH_MS = 48;
+const PROJECTILE_WORLD_SMOOTH_MS = 22;
 const SPIKE_WORLD_SMOOTH_MS = 42;
 const PLAYER_WORLD_SNAP_DISTANCE = 900;
 const PROJECTILE_WORLD_SNAP_DISTANCE = 1_400;
@@ -178,6 +179,7 @@ export class GameScene extends Phaser.Scene {
   private boostHud!: Phaser.GameObjects.Graphics;
   private boostHudTitle!: Phaser.GameObjects.Text;
   private boostHudText!: Phaser.GameObjects.Text;
+  private powerupHudText!: Phaser.GameObjects.Text;
   private spikeSlowText!: Phaser.GameObjects.Text;
   private flagBannerText!: Phaser.GameObjects.Text;
   private carrierWorldLabel!: Phaser.GameObjects.Text;
@@ -351,17 +353,22 @@ export class GameScene extends Phaser.Scene {
     const isLocalPlayer = localPlayer !== undefined && player.id === localPlayer.id;
     const basePlayerScale = (this.toScreenRadius(PLAYER_RADIUS) / PLAYER_BODY_RADIUS_PX) * PLAYER_SIZE_MULTIPLIER;
     const visualWorld = isLocalPlayer
-      ? { x: player.x, y: player.y }
+      ? this.getSmoothedWorldPoint(
+          this.playerVisualWorld,
+          id,
+          player.x,
+          player.y,
+          delta,
+          LOCAL_PLAYER_SMOOTH_MS,
+          PLAYER_WORLD_SNAP_DISTANCE * 1.35,
+        )
       : this.getSmoothedWorldPoint(this.playerVisualWorld, id, player.x, player.y, delta, REMOTE_PLAYER_WORLD_SMOOTH_MS, PLAYER_WORLD_SNAP_DISTANCE);
     const targetScreenX = this.toScreenX(visualWorld.x);
     const targetScreenY = this.toScreenY(visualWorld.y);
-    if (isLocalPlayer) {
-      this.playerVisualWorld.set(id, visualWorld);
-      visual.setPosition(targetScreenX, targetScreenY);
-    } else {
-      visual.setPosition(targetScreenX, targetScreenY);
-    }
-    visual.rotation = player.rotation;
+    visual.setPosition(targetScreenX, targetScreenY);
+    const rotAlpha = Math.min(1, delta / (isLocalPlayer ? 45 : 65));
+    const rotDelta = Phaser.Math.Angle.ShortestBetween(visual.rotation, player.rotation);
+    visual.rotation += rotDelta * rotAlpha;
     const body = visual.getAt(0) as Phaser.GameObjects.Arc;
     const nose = visual.getAt(1) as Phaser.GameObjects.Triangle;
     const carrierRing = visual.getAt(2) as Phaser.GameObjects.Arc;
@@ -369,13 +376,16 @@ export class GameScene extends Phaser.Scene {
     if (isLocalPlayer) {
       const cosmeticTier = this.getCosmeticTier(player.score);
       const accent = cosmeticTier >= 3 ? 0xff79ec : cosmeticTier >= 2 ? 0x71ffed : cosmeticTier >= 1 ? 0xfff46b : 0xffd46b;
-      const strokeColor = player.shieldHits > 0 ? 0x5cf0ff : accent;
+      const strokeColor =
+        player.shieldHits > 0 ? 0x5cf0ff : player.repelMs > 0 ? 0xc07dff : player.magnetMs > 0 ? 0xff9c5c : accent;
       const strokeW = player.shieldHits > 0 ? 6 : 5;
       body.setStrokeStyle(strokeW, strokeColor, 1);
       nose.setFillStyle(accent, 1);
       visual.setScale(basePlayerScale * LOCAL_PLAYER_SCALE_MULTIPLIER);
     } else {
-      body.setStrokeStyle(player.shieldHits > 0 ? 4 : 3, player.shieldHits > 0 ? 0x5cf0ff : 0xffffff, 0.95);
+      const strokeColor =
+        player.shieldHits > 0 ? 0x5cf0ff : player.repelMs > 0 ? 0xc07dff : player.magnetMs > 0 ? 0xff9c5c : 0xffffff;
+      body.setStrokeStyle(player.shieldHits > 0 ? 4 : player.repelMs > 0 || player.magnetMs > 0 ? 4 : 3, strokeColor, 0.95);
       nose.setFillStyle(0xffffff, 0.95);
       visual.setScale(basePlayerScale);
     }
@@ -402,12 +412,16 @@ export class GameScene extends Phaser.Scene {
     const visual = this.pickupVisuals.get(id) ?? this.createPickupVisual(pickup.kind);
     const outerGlow = visual.getAt(0) as Phaser.GameObjects.Arc;
     const core = visual.getAt(1) as Phaser.GameObjects.Arc;
+    const label = visual.getAt(3) as Phaser.GameObjects.Text;
     const color = PICKUP_COLORS[pickup.kind] ?? 0xffffff;
     visual.x = this.toScreenX(pickup.x);
     visual.y = this.toScreenY(pickup.y);
     visual.setDepth(30);
     outerGlow.fillColor = color;
     core.fillColor = color;
+    label.setText(PICKUP_WORLD_LABELS[pickup.kind] ?? pickup.kind.toUpperCase());
+    label.setColor(pickup.active ? "#ffffff" : "#8899aa");
+    label.setStroke("#0f1432", 4);
     const pulse = 0.92 + 0.08 * Math.sin(this.time.now * 0.006 + pickup.x * 0.005);
     visual.alpha = pickup.active ? 0.98 : 0.2;
     const pickupScale = (this.toScreenRadius(PICKUP_RADIUS) / 18) * pulse;
@@ -494,6 +508,7 @@ export class GameScene extends Phaser.Scene {
     this.boostHud = this.add.graphics();
     this.boostHudTitle = this.add.text(24, 88, "BOOST", this.textStyle(13, "#ffe95c"));
     this.boostHudText = this.add.text(24, 104, "", this.textStyle(13, "#9fd7ff"));
+    this.powerupHudText = this.add.text(24, 178, "", this.textStyle(13, "#d8f7ff"));
     this.spikeSlowText = this.add.text(24, 156, "", this.textStyle(14, "#ff9f7a"));
     this.flagBannerText = this.add
       .text(0, 56, "YOU HAVE THE FLAG", {
@@ -557,6 +572,7 @@ export class GameScene extends Phaser.Scene {
       this.restartButton,
       this.boostHudTitle,
       this.boostHudText,
+      this.powerupHudText,
       this.spikeSlowText,
     ]) {
       text.setScrollFactor(0).setDepth(80);
@@ -932,7 +948,8 @@ export class GameScene extends Phaser.Scene {
   private updateHud(state: ArenaState): void {
     const localPlayer = this.getLocalPlayer();
     const remainingMs = Math.max(0, state.matchDurationMs - state.elapsedMs);
-    this.timerText.setText(`TIME ${Math.ceil(remainingMs / 1000)}`);
+    const modeLabel = getModeLabel(state.gameMode ?? "ffa");
+    this.timerText.setText(`${modeLabel} · ${Math.ceil(remainingMs / 1000)}s`);
     this.updateCountdownText(state);
 
     if (!localPlayer) {
@@ -941,10 +958,12 @@ export class GameScene extends Phaser.Scene {
       this.leaderboardPanel.clear();
       this.boostHud.clear();
       this.boostHudText.setText("");
+      this.powerupHudText.setText("");
       return;
     }
     const { hint } = getObjectiveWorldTarget(state, localPlayer);
     this.drawBoostHud(localPlayer);
+    this.drawPowerupHud(localPlayer);
 
     const neutral = this.getNeutralFlag(state);
     const carrierId = neutral?.carrierId ?? "";
@@ -1376,17 +1395,13 @@ export class GameScene extends Phaser.Scene {
     const scale = this.scale.width / CAMERA_VIEW_WIDTH_WORLD;
     const viewWidth = this.scale.width / scale;
     const viewHeight = this.scale.height / scale;
-    const idealFocusX = targetX;
-    const idealFocusY = targetY;
+    const smoothed = localPlayer ? this.playerVisualWorld.get(localPlayer.id) : undefined;
+    const idealFocusX = smoothed?.x ?? targetX;
+    const idealFocusY = smoothed?.y ?? targetY;
 
-    if (localPlayer) {
-      this.cameraFocusX = idealFocusX;
-      this.cameraFocusY = idealFocusY;
-    } else {
-      const followAlpha = Math.min(1, delta / CAMERA_FOLLOW_SMOOTH_MS);
-      this.cameraFocusX = Phaser.Math.Linear(this.cameraFocusX, idealFocusX, followAlpha);
-      this.cameraFocusY = Phaser.Math.Linear(this.cameraFocusY, idealFocusY, followAlpha);
-    }
+    const followAlpha = 1 - Math.exp(-Math.max(delta, 1) / CAMERA_FOLLOW_SMOOTH_MS);
+    this.cameraFocusX = Phaser.Math.Linear(this.cameraFocusX, idealFocusX, followAlpha);
+    this.cameraFocusY = Phaser.Math.Linear(this.cameraFocusY, idealFocusY, followAlpha);
 
     // This is the dedicated player camera: never clamp to arena bounds. The local
     // player stays centered even on FFA bases, corners, or beyond world edges.
@@ -1470,6 +1485,23 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
+  private drawPowerupHud(player: PlayerState): void {
+    const buffs: string[] = [];
+    if (player.speedBoostMs > 0) {
+      buffs.push(`Speed Up ${(player.speedBoostMs / 1000).toFixed(1)}s`);
+    }
+    if (player.shieldHits > 0) {
+      buffs.push("Shield (blocks 1 hit)");
+    }
+    if (player.magnetMs > 0) {
+      buffs.push(`Magnet ${(player.magnetMs / 1000).toFixed(1)}s`);
+    }
+    if (player.repelMs > 0) {
+      buffs.push(`Repel ${(player.repelMs / 1000).toFixed(1)}s`);
+    }
+    this.powerupHudText.setText(buffs.length > 0 ? buffs.join(" · ") : "");
+  }
+
   private createPlayerVisual(color: number): Phaser.GameObjects.Container {
     const body = this.add.circle(0, 0, PLAYER_BODY_RADIUS_PX, color, 0.96).setStrokeStyle(3, 0xffffff, 0.95);
     const nose = this.add.triangle(36, 0, 0, 0, -24, -14, -24, 14, 0xffffff, 0.95);
@@ -1484,7 +1516,16 @@ export class GameScene extends Phaser.Scene {
     const icon = this.add.graphics();
     this.drawPickupIcon(icon, kind);
     icon.setDepth(1);
-    return this.add.container(0, 0, [outerGlow, core, icon]).setDepth(30);
+    const label = this.add
+      .text(0, 24, PICKUP_WORLD_LABELS[kind] ?? kind.toUpperCase(), {
+        color: "#ffffff",
+        fontFamily: "Segoe UI, system-ui, sans-serif",
+        fontSize: "11px",
+        fontStyle: "700",
+        letterSpacing: 1,
+      })
+      .setOrigin(0.5, 0);
+    return this.add.container(0, 0, [outerGlow, core, icon, label]).setDepth(30);
   }
 
   /** Vector icons inside the pickup core. All drawn at radius ~7 around (0,0) so they sit inside the 11px core. */

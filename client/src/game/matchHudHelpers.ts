@@ -45,6 +45,13 @@ function teamHomeCenter(team: string, gameMode?: string): { x: number; y: number
   return { x: baseMinX + half, y: baseMinY + half };
 }
 
+const MODE_LABELS: Record<string, string> = {
+  ffa: "Solo FFA",
+  team_ctf: "Team CTF",
+  race: "Race",
+  sandbox: "Sandbox",
+};
+
 /** Where to point the player and a short HUD line for the neutral-flag mode. */
 export function getObjectiveWorldTarget(state: ArenaState, local: PlayerState): { x: number; y: number; hint: string } {
   const neutral = state.flags.get(NEUTRAL_FLAG_ID);
@@ -93,6 +100,10 @@ export function getObjectiveWorldTarget(state: ArenaState, local: PlayerState): 
     y: state.captureY,
     hint: "Hold the center circle — majority wins the round",
   };
+}
+
+export function getModeLabel(gameMode: string): string {
+  return MODE_LABELS[gameMode] ?? gameMode;
 }
 
 /** True when the point lies inside another team's corner safe zone. */
