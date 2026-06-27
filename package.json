@@ -12,8 +12,8 @@
     "shared"
   ],
   "scripts": {
-    "dev": "npm run dev --workspace @core-surge/client",
-    "dev:local": "concurrently \"npm run dev --workspace @core-surge/server\" \"npm run dev --workspace @core-surge/client\"",
+    "dev": "concurrently \"npm run dev --workspace @core-surge/server\" \"npm run dev --workspace @core-surge/client\"",
+    "dev:client": "npm run dev --workspace @core-surge/client",
     "build": "npm run build --workspace @core-surge/shared && npm run build --workspace @core-surge/server && npm run build --workspace @core-surge/client",
     "start": "npx tsx server/src/index.ts",
     "test": "npm run test --workspace @core-surge/server"

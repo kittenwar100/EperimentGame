@@ -237,17 +237,18 @@ export class GameScene extends Phaser.Scene {
     try {
       this.statusText.setText("Joining…");
       await this.netClient.join(options, this.sdk.getInviteRoomId());
-      const hasLocalPlayer = await this.waitForLocalPlayer(3500);
+      const hasLocalPlayer = await this.waitForLocalPlayer(10000);
       if (!hasLocalPlayer) {
         throw new Error("Joined room but local player did not appear in state");
       }
       this.statusText.setText("");
       this.sdk.gameplayStart();
     } catch (error) {
-      console.error("Failed to join tunnel race", error);
+      console.error("Failed to join arena", error);
       this.netClient.leave();
-      this.statusText.setText("Reconnecting...");
-      this.time.delayedCall(900, () => {
+      const server = this.netClient.getServerUrlForDisplay();
+      this.statusText.setText(`Cannot reach server — retrying… (${server})`);
+      this.time.delayedCall(2000, () => {
         void this.startMatch(options);
       });
     }
@@ -268,6 +269,9 @@ export class GameScene extends Phaser.Scene {
     const room = this.netClient.room;
     const state = room?.state;
     if (!state?.players) {
+      if (room && this.statusText.text === "") {
+        this.statusText.setText("Syncing arena…");
+      }
       return;
     }
 
@@ -895,7 +899,7 @@ export class GameScene extends Phaser.Scene {
     }
 
     const players = room.state.players;
-    const sid = this.netClient.getLocalSessionId().trim();
+    const sid = (room.sessionId?.trim() || this.netClient.getLocalSessionId().trim());
 
     if (sid.length > 0) {
       const direct = players.get(sid);
@@ -904,24 +908,15 @@ export class GameScene extends Phaser.Scene {
       }
       for (const [mapKey, p] of players.entries()) {
         if (!p) continue;
-        if (p.id === sid || mapKey === sid) {
+        if (mapKey === sid || p.id === sid) {
           return p;
         }
       }
     }
 
-    const all = [...players.values()].filter((p): p is PlayerState => Boolean(p));
-    const humans = all.filter((p) => p.isBot !== true);
+    const humans = [...players.values()].filter((p): p is PlayerState => Boolean(p) && p.isBot !== true);
     if (humans.length === 1) {
       return humans[0];
-    }
-
-    const wantName = this.netClient.getJoinDisplayName().trim();
-    if (wantName.length > 0 && humans.length > 0) {
-      const named = humans.filter((h) => (h.name || "").trim() === wantName);
-      if (named.length === 1) {
-        return named[0];
-      }
     }
 
     return undefined;
@@ -949,19 +944,22 @@ export class GameScene extends Phaser.Scene {
     const localPlayer = this.getLocalPlayer();
     const remainingMs = Math.max(0, state.matchDurationMs - state.elapsedMs);
     const modeLabel = getModeLabel(state.gameMode ?? "ffa");
-    const teamLabel = localPlayer.team?.startsWith("ffa") ? localPlayer.team.slice(3) : localPlayer.team;
-    this.timerText.setText(`${modeLabel} · ${Math.ceil(remainingMs / 1000)}s · base ${teamLabel}`);
-    this.updateCountdownText(state);
 
     if (!localPlayer) {
-      this.statusText.setText("Joining…");
+      this.timerText.setText(`${modeLabel} · ${Math.ceil(remainingMs / 1000)}s`);
+      this.statusText.setText("Syncing your player…");
       this.leaderboardText.setText("");
       this.leaderboardPanel.clear();
       this.boostHud.clear();
       this.boostHudText.setText("");
       this.powerupHudText.setText("");
+      this.updateCountdownText(state);
       return;
     }
+
+    const teamLabel = localPlayer.team?.startsWith("ffa") ? localPlayer.team.slice(3) : localPlayer.team;
+    this.timerText.setText(`${modeLabel} · ${Math.ceil(remainingMs / 1000)}s · base ${teamLabel}`);
+    this.updateCountdownText(state);
     const { hint } = getObjectiveWorldTarget(state, localPlayer);
     this.drawBoostHud(localPlayer);
     this.drawPowerupHud(localPlayer);
