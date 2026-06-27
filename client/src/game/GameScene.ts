@@ -352,6 +352,7 @@ export class GameScene extends Phaser.Scene {
     const visual = this.playerVisuals.get(id) ?? this.createPlayerVisual(player.color);
     const isLocalPlayer = localPlayer !== undefined && player.id === localPlayer.id;
     const basePlayerScale = (this.toScreenRadius(PLAYER_RADIUS) / PLAYER_BODY_RADIUS_PX) * PLAYER_SIZE_MULTIPLIER;
+    const playerDisplayScale = basePlayerScale * LOCAL_PLAYER_SCALE_MULTIPLIER;
     const visualWorld = isLocalPlayer
       ? this.getSmoothedWorldPoint(
           this.playerVisualWorld,
@@ -381,14 +382,13 @@ export class GameScene extends Phaser.Scene {
       const strokeW = player.shieldHits > 0 ? 6 : 5;
       body.setStrokeStyle(strokeW, strokeColor, 1);
       nose.setFillStyle(accent, 1);
-      visual.setScale(basePlayerScale * LOCAL_PLAYER_SCALE_MULTIPLIER);
     } else {
       const strokeColor =
         player.shieldHits > 0 ? 0x5cf0ff : player.repelMs > 0 ? 0xc07dff : player.magnetMs > 0 ? 0xff9c5c : 0xffffff;
       body.setStrokeStyle(player.shieldHits > 0 ? 4 : player.repelMs > 0 || player.magnetMs > 0 ? 4 : 3, strokeColor, 0.95);
       nose.setFillStyle(0xffffff, 0.95);
-      visual.setScale(basePlayerScale);
     }
+    visual.setScale(playerDisplayScale);
     const isFlagCarrier = id === this.flagCarrierId;
     const flagShielded = isFlagCarrier && this.flagStealProtectionMs > 0;
     carrierRing.setVisible(isFlagCarrier);

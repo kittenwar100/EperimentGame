@@ -42,18 +42,34 @@ export class ArenaRoom extends Room<{ state: ArenaState }> {
   }
 
   override onJoin(client: Client, options: JoinOptions): void {
-    const humansBefore = [...this.roomState.players.values()].filter((p) => !p.isBot).length;
+    const humansBefore = this.simulation.countHumanPlayers();
     if (humansBefore === 0) {
       this.roomState.gameMode = resolveMode(options.mode);
     }
     const displayName = (options.name ?? "Runner").slice(0, 18);
+    const mode = this.roomState.gameMode === "ffa" || humansBefore === 0 ? resolveMode(options.mode) : this.roomState.gameMode;
+
+    if (mode === "ffa") {
+      if (humansBefore === 0) {
+        this.roomState.gameMode = "ffa";
+        this.simulation.prepareSoloFfaForHumanJoin();
+      }
+      this.simulation.addHumanReplacingBot(client.sessionId, displayName, humansBefore);
+      if (humansBefore === 0) {
+        this.simulation.restartMatch();
+      }
+      this.simulation.finalizeSoloFfaHumanPlacement(client.sessionId, humansBefore);
+      this.simulation.reconcileSoloFfaHumanTeamsNow();
+      return;
+    }
+
     if (humansBefore === 0) {
+      this.roomState.gameMode = resolveMode(options.mode);
       this.simulation.addPlayer(client.sessionId, displayName, false);
       this.simulation.restartMatch();
     } else {
       this.simulation.addHumanReplacingBot(client.sessionId, displayName);
     }
-    this.simulation.finalizeSoloFfaHumanPlacement(client.sessionId);
   }
 
   override onLeave(client: Client): void {

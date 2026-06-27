@@ -223,6 +223,8 @@ export class GameSimulation {
   private worldEventCursor = 0;
   /** When a human leaves, the next backfill bot spawns in their slot. */
   private pendingBotSlot: PlayerSlot | null = null;
+  /** Solo FFA: stable join slot per human (0→ffa0, 1→ffa1, …) so team assignment never depends on stale team fields. */
+  private readonly soloFfaHumanSlotIndex = new Map<string, number>();
   /** {@link GameSimulation.update} sets this when the round leaves countdown (FFA frenzy is relative to live time). */
   private roundLiveStartedAtElapsedMs = 0;
 
@@ -372,29 +374,57 @@ export class GameSimulation {
     }
   }
 
-  /** After join, guarantee solo FFA humans each occupy a unique base (ffa0..ffa7). */
-  finalizeSoloFfaHumanPlacement(playerId: string): void {
+  /** Solo FFA: fill all 8 base slots with bots before the first human replaces one. */
+  prepareSoloFfaForHumanJoin(): void {
     if (!this.isFfa()) return;
-    const player = this.state.players.get(playerId);
-    if (!player || player.isBot) return;
-
-    const teamTakenByOther = [...this.state.players.values()].some(
-      (other) => other.id !== playerId && other.team === player.team,
-    );
-    if (teamTakenByOther) {
-      player.team = this.pickOpenSoloTeamSlot(playerId);
+    const humanCount = [...this.state.players.values()].filter((p) => p.isBot !== true).length;
+    if (humanCount > 0) return;
+    for (const id of [...this.state.players.keys()].filter((bid) => bid.startsWith(BOT_IDS))) {
+      this.removePlayer(id);
     }
+    for (let i = 0; i < MAX_BOTS; i += 1) {
+      this.addPlayer(`${BOT_IDS}seed-${i}`, "", true);
+    }
+  }
 
-    const spawn = this.pickTeamBaseSpawnPoint(player);
-    player.x = spawn.x;
-    player.y = spawn.y;
-    player.vx = 0;
-    player.vy = 0;
+  /** Humans already in the room (used for join-order slot assignment). */
+  countHumanPlayers(excludePlayerId?: string): number {
+    return [...this.state.players.values()].filter((p) => p.isBot !== true && p.id !== excludePlayerId).length;
+  }
+
+  /** Run immediately after a human joins so slot/team is correct before the next tick. */
+  reconcileSoloFfaHumanTeamsNow(): void {
+    if (!this.isFfa()) return;
+    this.reconcileSoloFfaHumanTeams();
+  }
+
+  /** After join, guarantee solo FFA humans each occupy a unique base (ffa0..ffa7). */
+  finalizeSoloFfaHumanPlacement(playerId: string, soloFfaSlotIndex?: number): void {
+    if (!this.isFfa()) return;
+    this.applySoloFfaHumanTeamAndBase(playerId, soloFfaSlotIndex);
   }
 
   /** Joining humans take an existing bot's team and position instead of spawning at base. */
-  addHumanReplacingBot(id: string, name: string): void {
+  addHumanReplacingBot(id: string, name: string, soloFfaSlotIndex?: number): void {
     const botIds = [...this.state.players.keys()].filter((bid) => bid.startsWith(BOT_IDS));
+
+    if (this.isFfa()) {
+      const team = this.assignSoloFfaHumanTeam(id, soloFfaSlotIndex);
+      const botId = botIds.find((bid) => this.state.players.get(bid)?.team === team);
+      if (botId) {
+        this.removePlayer(botId, { preserveBotSlot: true });
+      }
+      const spawn = this.pickTeamBaseSpawnPoint({ team } as PlayerState);
+      this.addPlayer(id, name, false, {
+        team,
+        x: spawn.x,
+        y: spawn.y,
+        rotation: randomRange(-Math.PI, Math.PI),
+      });
+      this.applySoloFfaHumanTeamAndBase(id, soloFfaSlotIndex);
+      return;
+    }
+
     const botId = this.pickBotIdForHumanReplacement(botIds);
     let slot: PlayerSlot | undefined;
     if (botId) {
@@ -421,7 +451,7 @@ export class GameSimulation {
     const spawn =
       slot != null
         ? { x: slot.x, y: slot.y }
-        : isBot && !this.isRace()
+        : isBot && !this.isRace() && !this.isFfa()
           ? this.pickUniqueBotEdgeSpawnPoint()
           : this.isSoloMode() || this.isTeamCtf()
             ? this.pickTeamBaseSpawnPoint(player)
@@ -475,6 +505,7 @@ export class GameSimulation {
     this.ammoRechargeAtMs.delete(id);
     this.botNextFireAtMs.delete(id);
     this.wasInOwnSafeZone.delete(id);
+    this.soloFfaHumanSlotIndex.delete(id);
   }
 
   setInput(id: string, input: InputState): void {
@@ -543,6 +574,13 @@ export class GameSimulation {
   }
 
   private updateDynamicCapturePoint(): void {
+    if (this.isFfa()) {
+      this.state.captureX = this.state.captureAnchorX;
+      this.state.captureY = this.state.captureAnchorY;
+      this.state.captureRadius = CAPTURE_RADIUS;
+      return;
+    }
+
     const anchorX = this.state.captureAnchorX;
     const anchorY = this.state.captureAnchorY;
     let radius = CAPTURE_RADIUS;
@@ -562,18 +600,6 @@ export class GameSimulation {
       radius *= 1.34;
     }
     this.state.captureRadius = Math.max(CAPTURE_RADIUS * 0.55, radius);
-
-    if (this.isFfa()) {
-      const margin = this.state.captureRadius + 90;
-      const rIn = Math.max(120, FFA_OCTAGON_RADIUS - margin);
-      if (!pointInOctagon(this.state.captureX, this.state.captureY, FFA_OCTAGON_CENTER_X, FFA_OCTAGON_CENTER_Y, rIn)) {
-        const c = clampToOctagon(this.state.captureX, this.state.captureY, FFA_OCTAGON_CENTER_X, FFA_OCTAGON_CENTER_Y, rIn);
-        this.state.captureX = c.x;
-        this.state.captureY = c.y;
-        this.state.captureAnchorX = c.x;
-        this.state.captureAnchorY = c.y;
-      }
-    }
   }
 
   private updateSlowZones(deltaMs: number): void {
@@ -684,7 +710,8 @@ export class GameSimulation {
       }
       const movement = normalizeVector(clamp(input.moveX, -1, 1), clamp(input.moveY, -1, 1));
       const moving = Math.hypot(input.moveX, input.moveY) > 0.02;
-      const midfieldBoost = this.isInsideMidfield(player.x, player.y) ? MIDFIELD_SPEED_MULTIPLIER : 1;
+      const midfieldBoost =
+        !this.isFfa() && this.isInsideMidfield(player.x, player.y) ? MIDFIELD_SPEED_MULTIPLIER : 1;
       const powerupBoost = player.speedBoostMs > 0 ? SPEED_POWERUP_MULTIPLIER : 1;
       const spikeSlowFactor = player.spikeSlowMs > 0 ? SPIKE_SLOW_MULTIPLIER : 1;
       const speedFactor =
@@ -991,15 +1018,7 @@ export class GameSimulation {
   }
 
   private ensureBots(): void {
-    if (this.isFfa()) {
-      for (const id of [...this.state.players.keys()].filter((bid) => bid.startsWith(BOT_IDS))) {
-        this.removePlayer(id);
-      }
-      this.enforceOnePlayerPerSoloTeam();
-      return;
-    }
-
-    const humanCount = [...this.state.players.values()].filter((p) => !p.isBot).length;
+    const humanCount = [...this.state.players.values()].filter((p) => p.isBot !== true).length;
     if (humanCount === 0) {
       for (const id of [...this.state.players.keys()].filter((id) => id.startsWith(BOT_IDS))) {
         this.removePlayer(id);
@@ -1013,7 +1032,7 @@ export class GameSimulation {
     while (botIds.length < wantedBots) {
       const botId = `${BOT_IDS}${this.id("runner")}`;
       botIds.push(botId);
-      const slot = this.takePendingBotSlot();
+      const slot = this.isFfa() ? undefined : this.takePendingBotSlot();
       this.addPlayer(botId, "", true, slot);
     }
     while (botIds.length > wantedBots) {
@@ -1023,14 +1042,129 @@ export class GameSimulation {
       if (idx >= 0) botIds.splice(idx, 1);
       this.removePlayer(botId);
     }
+
+    if (this.isFfa()) {
+      this.reconcileSoloFfaHumanTeams();
+      this.enforceOnePlayerPerSoloTeam();
+    }
   }
 
-  /** Bot backfill target. Solo FFA is humans-only (one per color slot). Team CTF / race fill to 8 total. */
-  private getTargetBotCount(humanCount: number): number {
-    if (this.isFfa()) {
-      return 0;
+  /** Re-apply reserved ffa slot teams every tick so nothing can drift humans back onto ffa0/red. */
+  private reconcileSoloFfaHumanTeams(): void {
+    if (!this.isFfa()) return;
+    this.ensureSoloFfaHumansHaveSlots();
+    this.reclaimDuplicateSoloFfaSlots();
+    for (const [playerId, slot] of this.soloFfaHumanSlotIndex) {
+      const player = this.state.players.get(playerId);
+      if (!player || player.isBot === true) continue;
+      const team = FFA_TEAM_IDS[Math.min(slot, FFA_TEAM_IDS.length - 1)]!;
+      if (player.team === team) continue;
+      player.team = team;
+      const spawn = this.pickTeamBaseSpawnPoint(player);
+      player.x = spawn.x;
+      player.y = spawn.y;
+      player.vx = 0;
+      player.vy = 0;
     }
-    if (this.isRace() || this.isTeamCtf()) {
+  }
+
+  /** Register slot for any human missing from the map (e.g. after reconnect edge cases). */
+  private ensureSoloFfaHumansHaveSlots(): void {
+    for (const player of this.state.players.values()) {
+      if (player.isBot === true) continue;
+      if (!this.soloFfaHumanSlotIndex.has(player.id)) {
+        const slot = this.resolveSoloFfaHumanSlot(player.id);
+        this.soloFfaHumanSlotIndex.set(player.id, slot);
+      }
+    }
+  }
+
+  /** If two humans were both assigned slot 0 (race on join), bump duplicates to the next free slot. */
+  private reclaimDuplicateSoloFfaSlots(): void {
+    const bySlot = new Map<number, string[]>();
+    for (const [playerId, slot] of this.soloFfaHumanSlotIndex) {
+      const list = bySlot.get(slot) ?? [];
+      list.push(playerId);
+      bySlot.set(slot, list);
+    }
+    for (const owners of bySlot.values()) {
+      if (owners.length <= 1) continue;
+      owners.sort();
+      for (let i = 1; i < owners.length; i += 1) {
+        const playerId = owners[i]!;
+        const slot = this.claimLowestFreeSoloFfaSlot(playerId);
+        this.soloFfaHumanSlotIndex.set(playerId, slot);
+      }
+    }
+  }
+
+  /** First human → ffa0, second → ffa1, etc. Never assigns a slot already held by another human. */
+  private assignSoloFfaHumanTeam(playerId: string, preferredSlot?: number): string {
+    const slot = this.resolveSoloFfaHumanSlot(playerId, preferredSlot);
+    this.soloFfaHumanSlotIndex.set(playerId, slot);
+    return FFA_TEAM_IDS[slot]!;
+  }
+
+  private resolveSoloFfaHumanSlot(playerId: string, preferredSlot?: number): number {
+    const existing = this.soloFfaHumanSlotIndex.get(playerId);
+    if (existing !== undefined) return existing;
+
+    const slotFreeFor = (slot: number): boolean => {
+      const owner = this.findSoloFfaSlotOwner(slot);
+      return owner === undefined || owner === playerId;
+    };
+
+    // Join order = how many humans already have a reserved slot (does not rely on isBot flags).
+    const orderSlot = clamp(this.soloFfaHumanSlotIndex.size, 0, FFA_TEAM_IDS.length - 1);
+    if (slotFreeFor(orderSlot)) {
+      return orderSlot;
+    }
+
+    if (preferredSlot !== undefined && slotFreeFor(preferredSlot)) {
+      return clamp(preferredSlot, 0, FFA_TEAM_IDS.length - 1);
+    }
+
+    const humanOrderSlot = clamp(this.countHumanPlayers(playerId), 0, FFA_TEAM_IDS.length - 1);
+    if (slotFreeFor(humanOrderSlot)) {
+      return humanOrderSlot;
+    }
+
+    return this.claimLowestFreeSoloFfaSlot(playerId);
+  }
+
+  private findSoloFfaSlotOwner(slot: number): string | undefined {
+    for (const [playerId, assigned] of this.soloFfaHumanSlotIndex) {
+      if (assigned === slot) return playerId;
+    }
+    return undefined;
+  }
+
+  private claimLowestFreeSoloFfaSlot(excludePlayerId?: string): number {
+    const used = new Set(
+      [...this.soloFfaHumanSlotIndex.entries()]
+        .filter(([id]) => id !== excludePlayerId)
+        .map(([, slot]) => slot),
+    );
+    for (let i = 0; i < FFA_TEAM_IDS.length; i += 1) {
+      if (!used.has(i)) return i;
+    }
+    return 0;
+  }
+
+  private applySoloFfaHumanTeamAndBase(playerId: string, preferredSlot?: number): void {
+    const player = this.state.players.get(playerId);
+    if (!player || player.isBot) return;
+    player.team = this.assignSoloFfaHumanTeam(playerId, preferredSlot);
+    const spawn = this.pickTeamBaseSpawnPoint(player);
+    player.x = spawn.x;
+    player.y = spawn.y;
+    player.vx = 0;
+    player.vy = 0;
+  }
+
+  /** Bot backfill target. Solo FFA / team modes fill to 8 total (bots only occupy empty slots). */
+  private getTargetBotCount(humanCount: number): number {
+    if (this.isFfa() || this.isRace() || this.isTeamCtf()) {
       return Math.max(0, MAX_BOTS - humanCount);
     }
     return TARGET_BOT_COUNT_SANDBOX;
@@ -1156,7 +1290,7 @@ export class GameSimulation {
     this.state.captureY = layoutCenter.y;
     this.state.captureAnchorX = layoutCenter.x;
     this.state.captureAnchorY = layoutCenter.y;
-    this.state.captureVariant = this.state.roundNumber % 3;
+    this.state.captureVariant = this.isFfa() ? 0 : this.state.roundNumber % 3;
     this.state.mapTheme = this.mapLayoutIndex;
     this.state.mutatorA = "";
     this.state.mutatorB = "";
@@ -1174,11 +1308,12 @@ export class GameSimulation {
 
     for (const player of this.state.players.values()) {
       player.alive = true;
-      const spawn = player.isBot
-        ? this.pickUniqueBotEdgeSpawnPoint(player.id)
-        : this.isSoloMode() || this.isTeamCtf()
+      const spawn =
+        this.isSoloMode() || this.isTeamCtf()
           ? this.pickTeamBaseSpawnPoint(player)
-          : this.pickSpawnPoint(player.id, false);
+          : player.isBot
+            ? this.pickUniqueBotEdgeSpawnPoint(player.id)
+            : this.pickSpawnPoint(player.id, false);
       player.x = spawn.x;
       player.y = spawn.y;
       player.vx = 0;
@@ -1803,6 +1938,7 @@ export class GameSimulation {
   private tryScoreNeutralFlag(player: PlayerState): void {
     const flag = this.getNeutralFlag();
     if (!flag || flag.carrierId !== player.id) return;
+    if (this.isInsideCaptureCircle(player.x, player.y)) return;
     if (!this.isInsideTeamSafeZone(player, player.team)) return;
     const endgame = this.isFfa()
       ? this.isFfaFrenzy()
@@ -1878,6 +2014,19 @@ export class GameSimulation {
     return this.pickOpenSoloTeamSlot();
   }
 
+  /** First ffa slot with no human yet (bots may still occupy it — replaced on join). */
+  private pickSoloTeamForNewHuman(excludePlayerId?: string): string {
+    const humanTeams = new Set(
+      [...this.state.players.values()]
+        .filter((p) => !p.isBot && p.id !== excludePlayerId)
+        .map((p) => p.team),
+    );
+    for (const team of FFA_TEAM_IDS) {
+      if (!humanTeams.has(team)) return team;
+    }
+    return FFA_TEAM_IDS[0]!;
+  }
+
   /** First team slot with no player on it yet (human or bot). */
   private pickOpenSoloTeamSlot(excludePlayerId?: string): string {
     const occupiedTeams = new Set(
@@ -1887,7 +2036,13 @@ export class GameSimulation {
     );
     const openTeams = this.getActiveTeams().filter((team) => !occupiedTeams.has(team));
     if (openTeams.length === 0) {
-      return this.getActiveTeams()[0] ?? "ffa0";
+      const counts = new Map<string, number>(this.getActiveTeams().map((team) => [team, 0]));
+      for (const player of this.state.players.values()) {
+        if (player.id === excludePlayerId) continue;
+        if (counts.has(player.team)) counts.set(player.team, (counts.get(player.team) ?? 0) + 1);
+      }
+      const least = [...counts.entries()].sort((a, b) => a[1] - b[1])[0];
+      return least?.[0] ?? this.getActiveTeams()[0] ?? "ffa0";
     }
     return openTeams[0]!;
   }
@@ -1903,14 +2058,15 @@ export class GameSimulation {
     }
     for (const ids of byTeam.values()) {
       if (ids.length <= 1) continue;
-      const keeper =
-        ids.find((id) => {
-          const p = this.state.players.get(id);
-          return p != null && !p.isBot;
-        }) ?? ids[0]!;
       for (const id of ids) {
-        if (id === keeper) continue;
-        this.finalizeSoloFfaHumanPlacement(id);
+        const player = this.state.players.get(id);
+        if (!player?.isBot) continue;
+        player.team = this.pickOpenSoloTeamSlot(id);
+        const spawn = this.pickTeamBaseSpawnPoint(player);
+        player.x = spawn.x;
+        player.y = spawn.y;
+        player.vx = 0;
+        player.vy = 0;
       }
     }
   }
@@ -2433,6 +2589,10 @@ export class GameSimulation {
 
   private isInsideMidfield(x: number, y: number): boolean {
     return Math.hypot(x - ARENA_WIDTH * 0.5, y - ARENA_HEIGHT * 0.5) <= MIDFIELD_RADIUS;
+  }
+
+  private isInsideCaptureCircle(x: number, y: number): boolean {
+    return Math.hypot(x - this.state.captureX, y - this.state.captureY) <= this.state.captureRadius;
   }
 
   private isCarryingEnemyFlag(player: PlayerState): boolean {
