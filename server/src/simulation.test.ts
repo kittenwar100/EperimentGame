@@ -440,6 +440,19 @@ test("solo FFA two humans replace bots on unique teams with six fillers", () => 
   assert.equal(new Set(humanTeams).size, 2, "each human must occupy a distinct solo team slot");
 });
 
+test("reconcile evicts duplicate humans from the same ffa base", () => {
+  const state = new ArenaState();
+  const simulation = new GameSimulation(state);
+  state.gameMode = "ffa";
+  simulation.prepareSoloFfaForHumanJoin();
+  simulation.joinSoloFfaHuman("h1", "One", 0);
+  simulation.joinSoloFfaHuman("h2", "Two", 0);
+  simulation.reconcileSoloFfaHumanTeamsNow();
+
+  assert.equal(state.players.get("h1")!.team, "ffa0");
+  assert.equal(state.players.get("h2")!.team, "ffa1");
+});
+
 test("joinSoloFfaHuman forces slot index to team mapping", () => {
   const state = new ArenaState();
   const simulation = new GameSimulation(state);

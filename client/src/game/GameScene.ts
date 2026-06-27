@@ -949,7 +949,8 @@ export class GameScene extends Phaser.Scene {
     const localPlayer = this.getLocalPlayer();
     const remainingMs = Math.max(0, state.matchDurationMs - state.elapsedMs);
     const modeLabel = getModeLabel(state.gameMode ?? "ffa");
-    this.timerText.setText(`${modeLabel} · ${Math.ceil(remainingMs / 1000)}s`);
+    const teamLabel = localPlayer.team?.startsWith("ffa") ? localPlayer.team.slice(3) : localPlayer.team;
+    this.timerText.setText(`${modeLabel} · ${Math.ceil(remainingMs / 1000)}s · base ${teamLabel}`);
     this.updateCountdownText(state);
 
     if (!localPlayer) {

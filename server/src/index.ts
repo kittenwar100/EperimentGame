@@ -16,7 +16,12 @@ const gameServer = new Server({
     );
 
     app.get("/health", (_req, res) => {
-      res.json({ ok: true, service: "core-surge-server", build: "solo-ffa-v7" });
+      res.json({
+        ok: true,
+        service: "core-surge-server",
+        build: "solo-ffa-v8",
+        ts: Date.now(),
+      });
     });
   },
 });

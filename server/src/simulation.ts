@@ -1087,14 +1087,55 @@ export class GameSimulation {
   /** Re-apply reserved ffa slot teams every tick so nothing can drift humans back onto ffa0/red. */
   private reconcileSoloFfaHumanTeams(): void {
     if (!this.isFfa()) return;
+    this.enforceUniqueHumanFfaTeams();
     this.ensureSoloFfaHumansHaveSlots();
     this.reclaimDuplicateSoloFfaSlots();
+    this.evictBotsFromHumanFfaTeams();
     for (const [playerId, slot] of this.soloFfaHumanSlotIndex) {
       const player = this.state.players.get(playerId);
       if (!player || player.isBot === true) continue;
       const team = FFA_TEAM_IDS[Math.min(slot, FFA_TEAM_IDS.length - 1)]!;
       if (player.team === team) continue;
       player.team = team;
+      const spawn = this.pickTeamBaseSpawnPoint(player);
+      player.x = spawn.x;
+      player.y = spawn.y;
+      player.vx = 0;
+      player.vy = 0;
+    }
+  }
+
+  /** Humans sorted by join slot always map to ffa0, ffa1, … — fixes duplicate red bases. */
+  private enforceUniqueHumanFfaTeams(): void {
+    const humanIds = [...this.state.players.keys()]
+      .filter((id) => {
+        const p = this.state.players.get(id);
+        return p != null && p.isBot !== true;
+      })
+      .sort((a, b) => {
+        const slotA = this.soloFfaHumanSlotIndex.get(a) ?? 999;
+        const slotB = this.soloFfaHumanSlotIndex.get(b) ?? 999;
+        if (slotA !== slotB) return slotA - slotB;
+        return a.localeCompare(b);
+      });
+
+    humanIds.forEach((playerId, index) => {
+      const slot = Math.min(index, FFA_TEAM_IDS.length - 1);
+      this.soloFfaHumanSlotIndex.set(playerId, slot);
+      const player = this.state.players.get(playerId);
+      if (!player) return;
+      player.team = FFA_TEAM_IDS[slot]!;
+    });
+  }
+
+  /** No bot may share an ffa base with a human (shows as a second red dot on the minimap). */
+  private evictBotsFromHumanFfaTeams(): void {
+    const humanTeams = new Set(
+      [...this.state.players.values()].filter((p) => p.isBot !== true).map((p) => p.team),
+    );
+    for (const player of this.state.players.values()) {
+      if (!player.isBot || !humanTeams.has(player.team)) continue;
+      player.team = this.pickOpenSoloTeamSlot(player.id);
       const spawn = this.pickTeamBaseSpawnPoint(player);
       player.x = spawn.x;
       player.y = spawn.y;
