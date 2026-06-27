@@ -68,7 +68,11 @@ export class NetClient {
   }
 
   async join(options: JoinOptions, inviteRoomId: string | null): Promise<Room<any, ArenaState>> {
-    this.joinDisplayName = (options.name ?? "Runner").trim().slice(0, 18);
+    const joinOptions: JoinOptions = {
+      mode: options.mode ?? "ffa",
+      name: (options.name ?? "Runner").trim().slice(0, 18),
+    };
+    this.joinDisplayName = joinOptions.name ?? "Runner";
     if (this.room) {
       this.refreshLocalSessionId();
       return this.room;
@@ -76,13 +80,27 @@ export class NetClient {
 
     const joinPromise = inviteRoomId
       ? this.client
-          .joinById<ArenaState>(inviteRoomId, options, ArenaState)
-          .catch(() => this.client.joinOrCreate<ArenaState>(ROOM_NAME, options, ArenaState))
-      : this.client.joinOrCreate<ArenaState>(ROOM_NAME, options, ArenaState);
+          .joinById<ArenaState>(inviteRoomId, joinOptions, ArenaState)
+          .catch(() => this.client.joinOrCreate<ArenaState>(ROOM_NAME, joinOptions, ArenaState))
+      : this.client.joinOrCreate<ArenaState>(ROOM_NAME, joinOptions, ArenaState);
     this.room = await withTimeout(joinPromise, 8000, "Joining arena");
 
     this.refreshLocalSessionId();
+    this.publishRoomIdToUrl(this.room.roomId);
     return this.room;
+  }
+
+  /** Writes ?roomId= so a second browser tab can join the same Colyseus room. */
+  private publishRoomIdToUrl(roomId: string): void {
+    if (!roomId || typeof window === "undefined") return;
+    try {
+      const url = new URL(window.location.href);
+      if (url.searchParams.get("roomId") === roomId) return;
+      url.searchParams.set("roomId", roomId);
+      window.history.replaceState({}, "", url.toString());
+    } catch {
+      // ignore
+    }
   }
 
   private refreshLocalSessionId(): void {

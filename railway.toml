@@ -11,6 +11,7 @@ builder = "NIXPACKS"
 buildCommand = "npm install --workspaces --include-workspace-root"
 
 [deploy]
+# Colyseus rooms are in-memory — run exactly 1 replica on Railway or players may land in separate rooms.
 startCommand = "npx tsx server/src/index.ts"
 healthcheckPath = "/health"
 healthcheckTimeout = 30

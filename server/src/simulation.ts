@@ -398,6 +398,41 @@ export class GameSimulation {
     this.reconcileSoloFfaHumanTeams();
   }
 
+  /**
+   * Solo FFA human join — slot is assigned by the room (0→ffa0/red, 1→ffa1/blue, …).
+   * This path bypasses all heuristic team picking so the 2nd human can never reuse red.
+   */
+  joinSoloFfaHuman(id: string, name: string, slotIndex: number): void {
+    if (!this.isFfa()) return;
+    const slot = clamp(slotIndex, 0, FFA_TEAM_IDS.length - 1);
+    const team = FFA_TEAM_IDS[slot]!;
+    this.soloFfaHumanSlotIndex.set(id, slot);
+
+    const botIds = [...this.state.players.keys()].filter((bid) => bid.startsWith(BOT_IDS));
+    const botId = botIds.find((bid) => this.state.players.get(bid)?.team === team);
+    if (botId) {
+      this.removePlayer(botId, { preserveBotSlot: true });
+    }
+
+    const spawn = this.pickTeamBaseSpawnPoint({ team } as PlayerState);
+    this.addPlayer(id, name, false, {
+      team,
+      x: spawn.x,
+      y: spawn.y,
+      rotation: randomRange(-Math.PI, Math.PI),
+    });
+
+    const player = this.state.players.get(id);
+    if (player) {
+      player.isBot = false;
+      player.team = team;
+      player.x = spawn.x;
+      player.y = spawn.y;
+      player.vx = 0;
+      player.vy = 0;
+    }
+  }
+
   /** After join, guarantee solo FFA humans each occupy a unique base (ffa0..ffa7). */
   finalizeSoloFfaHumanPlacement(playerId: string, soloFfaSlotIndex?: number): void {
     if (!this.isFfa()) return;
@@ -1070,12 +1105,12 @@ export class GameSimulation {
 
   /** Register slot for any human missing from the map (e.g. after reconnect edge cases). */
   private ensureSoloFfaHumansHaveSlots(): void {
-    for (const player of this.state.players.values()) {
-      if (player.isBot === true) continue;
-      if (!this.soloFfaHumanSlotIndex.has(player.id)) {
-        const slot = this.resolveSoloFfaHumanSlot(player.id);
-        this.soloFfaHumanSlotIndex.set(player.id, slot);
-      }
+    for (const playerId of this.state.players.keys()) {
+      const player = this.state.players.get(playerId);
+      if (!player || player.isBot === true) continue;
+      if (this.soloFfaHumanSlotIndex.has(playerId)) continue;
+      const slot = this.resolveSoloFfaHumanSlot(playerId);
+      this.soloFfaHumanSlotIndex.set(playerId, slot);
     }
   }
 

@@ -21,6 +21,8 @@ export class ArenaRoom extends Room<{ state: ArenaState }> {
 
   private readonly roomState = new ArenaState();
   private readonly simulation = new GameSimulation(this.roomState);
+  /** Monotonic solo FFA join index: 0 = first human (red), 1 = second (blue), … */
+  private soloFfaHumanJoinCounter = 0;
   override onCreate(options: JoinOptions = {}): void {
     this.setState(this.roomState);
     this.roomState.gameMode = resolveMode(options.mode);
@@ -50,15 +52,17 @@ export class ArenaRoom extends Room<{ state: ArenaState }> {
     const mode = this.roomState.gameMode === "ffa" || humansBefore === 0 ? resolveMode(options.mode) : this.roomState.gameMode;
 
     if (mode === "ffa") {
+      const slotIndex = this.soloFfaHumanJoinCounter;
+      this.soloFfaHumanJoinCounter += 1;
       if (humansBefore === 0) {
         this.roomState.gameMode = "ffa";
         this.simulation.prepareSoloFfaForHumanJoin();
       }
-      this.simulation.addHumanReplacingBot(client.sessionId, displayName, humansBefore);
+      this.simulation.joinSoloFfaHuman(client.sessionId, displayName, slotIndex);
       if (humansBefore === 0) {
         this.simulation.restartMatch();
       }
-      this.simulation.finalizeSoloFfaHumanPlacement(client.sessionId, humansBefore);
+      this.simulation.finalizeSoloFfaHumanPlacement(client.sessionId, slotIndex);
       this.simulation.reconcileSoloFfaHumanTeamsNow();
       return;
     }
